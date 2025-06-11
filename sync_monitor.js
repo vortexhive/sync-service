@@ -1,23 +1,43 @@
 // monitor.js - Simple monitoring dashboard for user sync
 const { Client } = require('pg');
+require('dotenv').config();
 
 class SyncMonitor {
   constructor() {
     this.sourceDbConfig = {
-      host: 'localhost',
-      port: 5432,
-      database: 'myusta_backend',
-      user: 'postgres',
-      password: 'd8P@ssw0rd2025'
+      host: process.env.SOURCE_DB_HOST || 'localhost',
+      port: parseInt(process.env.SOURCE_DB_PORT) || 5432,
+      database: process.env.SOURCE_DB_NAME || 'myusta_backend',
+      user: process.env.SOURCE_DB_USER || 'postgres',
+      password: process.env.SOURCE_DB_PASSWORD
     };
 
     this.chatDbConfig = {
-      host: 'localhost',
-      port: 5432,
-      database: 'myusta_chatapp',
-      user: 'postgres',
-      password: 'd8P@ssw0rd2025'
+      host: process.env.CHAT_DB_HOST || 'localhost',
+      port: parseInt(process.env.CHAT_DB_PORT) || 5432,
+      database: process.env.CHAT_DB_NAME || 'myusta_chatapp',
+      user: process.env.CHAT_DB_USER || 'postgres',
+      password: process.env.CHAT_DB_PASSWORD
     };
+
+    // Validate required environment variables
+    this.validateConfig();
+  }
+
+  validateConfig() {
+    const requiredVars = [
+      'SOURCE_DB_PASSWORD',
+      'CHAT_DB_PASSWORD'
+    ];
+
+    const missing = requiredVars.filter(varName => !process.env[varName]);
+    
+    if (missing.length > 0) {
+      console.error('❌ Missing required environment variables:');
+      missing.forEach(varName => console.error(`   - ${varName}`));
+      console.error('\nPlease check your .env file');
+      process.exit(1);
+    }
   }
 
   async getDetailedStats() {
@@ -58,30 +78,53 @@ class SyncMonitor {
         `)
       ]);
 
-      // Find discrepancies
-      const discrepanciesResult = await sourceClient.query(`
-        WITH source_users AS (
-          SELECT id, updated_at, role
-          FROM users 
-          WHERE status = 'active'
-        ),
-        chat_users AS (
-          SELECT "externalId" as id, "updatedAt" as updated_at, role
-          FROM myusta_chatapp.users
-        )
-        SELECT 
-          s.id,
-          s.updated_at as source_updated,
-          c.updated_at as chat_updated,
-          s.role as source_role,
-          c.role as chat_role
-        FROM source_users s
-        LEFT JOIN chat_users c ON s.id = c.id
-        WHERE c.id IS NULL 
-           OR s.updated_at > c.updated_at
-           OR s.role != c.role
-        LIMIT 10
+      // Find discrepancies using separate queries instead of cross-database joins
+      const sourceUsersResult = await sourceClient.query(`
+        SELECT id, updated_at, role
+        FROM users 
+        WHERE status = 'active'
       `);
+
+      const chatUsersResult = await chatClient.query(`
+        SELECT "externalId" as id, "updatedAt" as updated_at, role
+        FROM users
+      `);
+
+      // Process discrepancies in application logic
+      const sourceUsers = new Map(sourceUsersResult.rows.map(user => [user.id, user]));
+      const chatUsers = new Map(chatUsersResult.rows.map(user => [user.id, user]));
+      
+      const discrepancies = [];
+      let discrepancyCount = 0;
+      
+      for (const [id, sourceUser] of sourceUsers) {
+        if (discrepancyCount >= 10) break; // Limit to 10 discrepancies
+        
+        const chatUser = chatUsers.get(id);
+        
+        if (!chatUser) {
+          discrepancies.push({
+            id,
+            source_updated: sourceUser.updated_at,
+            chat_updated: null,
+            source_role: sourceUser.role,
+            chat_role: null
+          });
+          discrepancyCount++;
+        } else if (
+          new Date(sourceUser.updated_at) > new Date(chatUser.updated_at) ||
+          sourceUser.role !== chatUser.role
+        ) {
+          discrepancies.push({
+            id,
+            source_updated: sourceUser.updated_at,
+            chat_updated: chatUser.updated_at,
+            source_role: sourceUser.role,
+            chat_role: chatUser.role
+          });
+          discrepancyCount++;
+        }
+      }
 
       return {
         source: {
@@ -95,7 +138,7 @@ class SyncMonitor {
           recent24h: parseInt(chatRecentResult.rows[0].count),
           roleBreakdown: chatRoleStatsResult.rows
         },
-        discrepancies: discrepanciesResult.rows,
+        discrepancies: discrepancies,
         status: {
           consistent: Math.abs(
             parseInt(sourceActiveResult.rows[0].count) - 
@@ -119,7 +162,7 @@ class SyncMonitor {
     try {
       await sourceClient.connect();
       
-      // Check if trigger exists
+      // Check if trigger exists (no database reference needed)
       const triggerResult = await sourceClient.query(`
         SELECT EXISTS (
           SELECT 1 FROM pg_trigger 
@@ -165,7 +208,7 @@ class SyncMonitor {
     console.log(`\n🔍 OVERALL STATUS: ${statusIcon} ${stats.status.consistent ? 'HEALTHY' : 'NEEDS ATTENTION'}`);
     
     // Source database stats
-    console.log('\n📈 SOURCE DATABASE (myusta_backend):');
+    console.log('\n📈 SOURCE DATABASE:');
     console.log(`   Total Users: ${stats.source.total.toLocaleString()}`);
     console.log(`   Active Users: ${stats.source.active.toLocaleString()}`);
     console.log(`   Updated (24h): ${stats.source.recent24h.toLocaleString()}`);
@@ -176,7 +219,7 @@ class SyncMonitor {
     });
     
     // Chat database stats
-    console.log('\n💬 CHAT DATABASE (myusta_chatapp):');
+    console.log('\n💬 CHAT DATABASE:');
     console.log(`   Total Users: ${stats.chat.total.toLocaleString()}`);
     console.log(`   Updated (24h): ${stats.chat.recent24h.toLocaleString()}`);
     
@@ -209,7 +252,7 @@ class SyncMonitor {
         console.log(`   ${index + 1}. User ${disc.id}:`);
         if (!disc.chat_updated) {
           console.log('      ❌ Missing in chat database');
-        } else if (disc.source_updated > disc.chat_updated) {
+        } else if (new Date(disc.source_updated) > new Date(disc.chat_updated)) {
           console.log(`      ⏰ Outdated: Source(${disc.source_updated}) > Chat(${disc.chat_updated})`);
         } else if (disc.source_role !== disc.chat_role) {
           console.log(`      👤 Role mismatch: ${disc.source_role} != ${disc.chat_role}`);
@@ -323,6 +366,11 @@ if (require.main === module) {
 Examples:
   node monitor.js stats                 - One-time stats report
   node monitor.js watch 60              - Live monitoring every 60 seconds
+
+Setup:
+  1. Install dependencies: npm install pg dotenv
+  2. Copy .env.template to .env
+  3. Update .env with your database credentials
       `);
       break;
   }

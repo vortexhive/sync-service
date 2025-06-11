@@ -1,24 +1,25 @@
-// userTableSync.js - Complete sync service for myusta_backend -> myusta_chatapp
+// userTableSync.js - Complete sync service for source -> chat database
 const { Client } = require('pg');
+require('dotenv').config();
 
 class UserTableSyncService {
   constructor() {
-    // Source database config (myusta_backend)
+    // Source database config
     this.sourceDbConfig = {
-      host: 'localhost',
-      port: 5432,
-      database: 'myusta_backend',
-      user: 'postgres',
-      password: 'd8P@ssw0rd2025'
+      host: process.env.SOURCE_DB_HOST || 'localhost',
+      port: parseInt(process.env.SOURCE_DB_PORT) || 5432,
+      database: process.env.SOURCE_DB_NAME || 'myusta_backend',
+      user: process.env.SOURCE_DB_USER || 'postgres',
+      password: process.env.SOURCE_DB_PASSWORD
     };
 
-    // Destination database config (myusta_chatapp)
+    // Destination database config (chat app)
     this.chatDbConfig = {
-      host: 'localhost',
-      port: 5432,
-      database: 'myusta_chatapp',
-      user: 'postgres',
-      password: 'd8P@ssw0rd2025'
+      host: process.env.CHAT_DB_HOST || 'localhost',
+      port: parseInt(process.env.CHAT_DB_PORT) || 5432,
+      database: process.env.CHAT_DB_NAME || 'myusta_chatapp',
+      user: process.env.CHAT_DB_USER || 'postgres',
+      password: process.env.CHAT_DB_PASSWORD
     };
 
     this.isListening = false;
@@ -27,6 +28,30 @@ class UserTableSyncService {
       lastSyncTime: null,
       errors: 0
     };
+
+    // Validate required environment variables
+    this.validateConfig();
+  }
+
+  validateConfig() {
+    const requiredVars = [
+      'SOURCE_DB_PASSWORD',
+      'CHAT_DB_PASSWORD'
+    ];
+
+    const missing = requiredVars.filter(varName => !process.env[varName]);
+    
+    if (missing.length > 0) {
+      console.error('❌ Missing required environment variables:');
+      missing.forEach(varName => console.error(`   - ${varName}`));
+      console.error('\nPlease check your .env file');
+      process.exit(1);
+    }
+
+    // Log configuration (without passwords)
+    console.log('🔧 Database Configuration:');
+    console.log(`   Source: ${this.sourceDbConfig.user}@${this.sourceDbConfig.host}:${this.sourceDbConfig.port}/${this.sourceDbConfig.database}`);
+    console.log(`   Chat: ${this.chatDbConfig.user}@${this.chatDbConfig.host}:${this.chatDbConfig.port}/${this.chatDbConfig.database}`);
   }
 
   // Transform source user data to chat user format
@@ -494,8 +519,6 @@ class UserTableSyncService {
   // Complete setup method
   async setup() {
     console.log('🚀 Setting up User Table Sync Service...');
-    console.log('   Source: myusta_backend');
-    console.log('   Destination: myusta_chatapp');
     
     try {
       // 1. Initial bulk sync
@@ -604,6 +627,11 @@ if (require.main === module) {
 
 Examples:
   node userTableSync.js bulk 500 0    - Sync 500 users starting from offset 0
+
+Setup:
+  1. Install dependencies: npm install pg dotenv
+  2. Copy .env.template to .env
+  3. Update .env with your database credentials
       `);
       break;
   }
