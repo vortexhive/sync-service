@@ -1,0 +1,35 @@
+{
+  "name": "myusta-user-sync",
+  "version": "1.0.0",
+  "description": "User synchronization service between myusta_backend and myusta_chatapp databases",
+  "main": "sync.js",
+  "scripts": {
+    "start": "node sync.js setup",
+    "sync": "node sync.js setup",
+    "bulk": "node sync.js bulk",
+    "verify": "node sync.js verify",
+    "realtime": "node sync.js realtime",
+    "monitor": "node monitor.js stats",
+    "watch": "node monitor.js watch",
+    "health": "node monitor.js health",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [
+    "postgresql",
+    "replication",
+    "sync",
+    "database",
+    "myusta"
+  ],
+  "author": "MyUsta Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
