@@ -258,6 +258,11 @@ class SyncMonitor {
           console.log(`      👤 Role mismatch: ${disc.source_role} != ${disc.chat_role}`);
         }
       });
+      
+      // Add helpful suggestion
+      console.log('\n💡 TO FIX DISCREPANCIES:');
+      console.log('   Run: node sync.js sync-all');
+      
     } else {
       console.log('\n✅ NO DISCREPANCIES FOUND');
     }
@@ -276,6 +281,11 @@ class SyncMonitor {
     console.log(`   Trigger Status: ${health.triggerExists ? '✅ Active' : '❌ Missing'}`);
     console.log(`   Recent Activity: ${health.recentActivity} users updated (1h)`);
     console.log(`   Overall Health: ${health.healthy ? '✅ Healthy' : '🚨 Unhealthy'}`);
+    
+    if (!health.triggerExists) {
+      console.log('\n💡 TO ENABLE REAL-TIME SYNC:');
+      console.log('   Run: node sync.js realtime');
+    }
   }
 
   async startContinuousMonitoring(intervalSeconds = 30) {

@@ -87,7 +87,7 @@ class UserTableSyncService {
     } else if (lastName) {
       return lastName;
     } else {
-      return 'User'; // Default name
+      return `User ${user.id.substring(0, 8)}`; // Fallback with partial ID
     }
   }
 
@@ -95,10 +95,8 @@ class UserTableSyncService {
   sanitizePhone(phone, userId) {
     if (!phone || phone.trim() === '') {
       // Generate a unique numeric placeholder phone using user ID
-      // Convert UUID to numeric: take first 8 hex chars and convert to decimal
       const hexPart = userId.replace(/-/g, '').substring(0, 8);
       const numericPart = parseInt(hexPart, 16).toString().substring(0, 9);
-      // Ensure it starts with 9 to make it look like a phone number and avoid conflicts
       return `9${numericPart.padStart(9, '0')}`;
     }
     
@@ -140,25 +138,146 @@ class UserTableSyncService {
       status: user.status,
       customerPreferences: user.customer_preferences,
       notificationSettings: {
-        app: user.notification_via_app || true,
-        email: user.notification_via_email || true,
-        sms: user.notification_via_sms || false
+        app: user.notification_via_app !== null ? user.notification_via_app : true,
+        email: user.notification_via_email !== null ? user.notification_via_email : true,
+        sms: user.notification_via_sms !== null ? user.notification_via_sms : false
       },
       termsAccepted: user.terms_and_conditions || false,
       ratings: {
-        average: user.average_rating,
-        total: user.total_ratings,
-        totalHires: user.total_hires,
-        totalViews: user.total_views,
-        lastHiredAt: user.last_hired_at
+        average: user.average_rating || null,
+        total: user.total_ratings || 0,
+        totalHires: user.total_hires || 0,
+        totalViews: user.total_views || 0,
+        lastHiredAt: user.last_hired_at || null
       },
       verification: {
         isVerified: user.is_verified || false,
         isFeatured: user.is_featured || false,
         searchBoost: user.search_boost || 0
       },
-      bio: user.bio
+      bio: user.bio || null,
+      hasPassword: !!user.password
     };
+  }
+
+  // Sync ALL users from source to chat (complete refresh)
+  async syncAllUsers() {
+    const sourceClient = new Client(this.sourceDbConfig);
+    const chatClient = new Client(this.chatDbConfig);
+    
+    try {
+      await sourceClient.connect();
+      await chatClient.connect();
+
+      console.log('📊 Getting total user count...');
+      const countResult = await sourceClient.query("SELECT COUNT(*) as count FROM users WHERE status = 'active'");
+      const totalUsers = parseInt(countResult.rows[0].count);
+      
+      console.log(`📋 Found ${totalUsers.toLocaleString()} active users to sync`);
+
+      const limit = 1000;
+      let offset = 0;
+      let totalSynced = 0;
+      let totalErrors = 0;
+
+      while (offset < totalUsers) {
+        console.log(`\n🔄 Processing batch ${Math.floor(offset/limit) + 1} (${offset + 1}-${Math.min(offset + limit, totalUsers)} of ${totalUsers})...`);
+        
+        const query = `
+          SELECT 
+            id, first_name, last_name, email, phone, email_verified, 
+            phone_verified, password, auth_provider, google_id, facebook_id, 
+            role, status, customer_preferences, profile_picture, 
+            notification_via_app, notification_via_email, notification_via_sms, 
+            terms_and_conditions, average_rating, total_ratings, total_hires, 
+            total_views, last_hired_at, is_verified, is_featured, search_boost, 
+            created_at, updated_at, bio
+          FROM users 
+          WHERE status = 'active' AND id IS NOT NULL
+          ORDER BY id
+          LIMIT $1 OFFSET $2
+        `;
+
+        const result = await sourceClient.query(query, [limit, offset]);
+        const users = result.rows;
+
+        let batchSynced = 0;
+        let batchErrors = 0;
+
+        for (const user of users) {
+          try {
+            const transformedUser = this.transformUserData(user);
+            
+            await chatClient.query(`
+              INSERT INTO users (
+                id, "externalId", name, phone, email, role, "socketId", 
+                "isOnline", "lastSeen", avatar, "metaData", "createdAt", 
+                "updatedAt", "firstName", "lastName"
+              ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+              )
+              ON CONFLICT ("externalId") DO UPDATE SET
+                name = EXCLUDED.name,
+                phone = EXCLUDED.phone,
+                email = EXCLUDED.email,
+                role = EXCLUDED.role,
+                avatar = EXCLUDED.avatar,
+                "metaData" = EXCLUDED."metaData",
+                "updatedAt" = EXCLUDED."updatedAt",
+                "firstName" = EXCLUDED."firstName",
+                "lastName" = EXCLUDED."lastName"
+            `, [
+              transformedUser.id,
+              transformedUser.externalId,
+              transformedUser.name,
+              transformedUser.phone,
+              transformedUser.email,
+              transformedUser.role,
+              transformedUser.socketId,
+              transformedUser.isOnline,
+              transformedUser.lastSeen,
+              transformedUser.avatar,
+              JSON.stringify(transformedUser.metaData),
+              transformedUser.createdAt,
+              transformedUser.updatedAt,
+              transformedUser.firstName,
+              transformedUser.lastName
+            ]);
+            
+            batchSynced++;
+          } catch (error) {
+            console.error(`❌ Error syncing user ${user.id}: ${error.message}`);
+            batchErrors++;
+          }
+        }
+
+        totalSynced += batchSynced;
+        totalErrors += batchErrors;
+        
+        console.log(`   ✅ Batch completed: ${batchSynced} synced, ${batchErrors} errors`);
+        console.log(`   📊 Progress: ${totalSynced}/${totalUsers} users (${Math.round((totalSynced/totalUsers)*100)}%)`);
+        
+        offset += limit;
+      }
+
+      this.syncStats.totalSynced += totalSynced;
+      this.syncStats.errors += totalErrors;
+      this.syncStats.lastSyncTime = new Date();
+
+      console.log(`\n🎉 ALL USERS SYNC COMPLETED!`);
+      console.log(`   ✅ Successfully synced: ${totalSynced.toLocaleString()}`);
+      console.log(`   ❌ Errors: ${totalErrors.toLocaleString()}`);
+      console.log(`   📊 Success rate: ${Math.round((totalSynced/(totalSynced+totalErrors))*100)}%`);
+
+      return { synced: totalSynced, errors: totalErrors };
+
+    } catch (error) {
+      console.error('❌ Complete sync error:', error);
+      throw error;
+    } finally {
+      await sourceClient.end();
+      await chatClient.end();
+    }
   }
 
   // Upsert single user to chat database
@@ -536,15 +655,19 @@ class UserTableSyncService {
         }
       }
       
-      // 2. Start real-time sync
+      // 2. Sync any remaining missing users
+      console.log('\n🎯 Checking for missing users...');
+      await this.syncAllUsers();
+      
+      // 3. Start real-time sync
       console.log('\n🔊 Starting real-time sync...');
       await this.startRealTimeSync();
       
-      // 3. Start scheduled backup sync
+      // 4. Start scheduled backup sync
       console.log('\n⏰ Starting scheduled sync...');
       const syncInterval = await this.startScheduledSync(5);
       
-      // 4. Initial verification
+      // 5. Initial verification
       console.log('\n📊 Verifying sync status...');
       await this.verifySyncStatus();
       
@@ -585,6 +708,19 @@ if (require.main === module) {
       syncService.setup();
       break;
       
+    case 'sync-all':
+      console.log('🔄 Starting complete sync of ALL users...');
+      syncService.syncAllUsers()
+        .then((result) => {
+          console.log(`✅ Complete sync finished: ${result.synced} synced, ${result.errors} errors`);
+          process.exit(0);
+        })
+        .catch(err => {
+          console.error(err);
+          process.exit(1);
+        });
+      break;
+      
     case 'bulk':
       const limit = parseInt(args[1]) || 1000;
       const offset = parseInt(args[2]) || 0;
@@ -620,13 +756,15 @@ if (require.main === module) {
       console.log(`
 🔄 User Table Sync Service Commands:
 
-  node userTableSync.js setup     - Complete setup with bulk + real-time sync
-  node userTableSync.js bulk      - One-time bulk sync
-  node userTableSync.js verify    - Check sync status
-  node userTableSync.js realtime  - Start real-time sync only
+  node userTableSync.js sync-all        - Sync ALL users from main DB to chat DB
+  node userTableSync.js setup           - Complete setup with bulk + real-time sync
+  node userTableSync.js bulk [limit]    - One-time bulk sync
+  node userTableSync.js verify          - Check sync status
+  node userTableSync.js realtime        - Start real-time sync only
 
 Examples:
-  node userTableSync.js bulk 500 0    - Sync 500 users starting from offset 0
+  node userTableSync.js sync-all                                   - Sync all users (recommended)
+  node userTableSync.js bulk 500 0                                - Sync 500 users starting from offset 0
 
 Setup:
   1. Install dependencies: npm install pg dotenv
