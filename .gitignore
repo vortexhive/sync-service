@@ -74,3 +74,7 @@ keys.text
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Deployment scripts
+deploy.sh
+*.deploy.sh
