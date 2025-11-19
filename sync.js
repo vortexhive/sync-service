@@ -1,5 +1,6 @@
 // userTableSync.js - Complete sync service for source -> chat database
 const { Pool } = require('pg');
+const http = require('http');
 require('dotenv').config();
 
 class UserTableSyncService {
@@ -995,6 +996,93 @@ class UserTableSyncService {
     }
   }
 
+  // HTTP server for health checks and status
+  startHttpServer() {
+    const port = parseInt(process.env.HTTP_PORT) || 9000;
+
+    this.httpServer = http.createServer((req, res) => {
+      // CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Content-Type', 'application/json');
+
+      if (req.url === '/health' || req.url === '/') {
+        // Health check endpoint
+        const healthStatus = this.getHealthStatus();
+        const statusCode = healthStatus.status === 'HEALTHY' ? 200 : 503;
+
+        res.writeHead(statusCode);
+        res.end(JSON.stringify({
+          status: healthStatus.status,
+          timestamp: new Date().toISOString(),
+          service: 'user-sync-service',
+          version: '1.0.0',
+          checks: healthStatus.checks,
+          recommendations: healthStatus.recommendations
+        }, null, 2));
+
+      } else if (req.url === '/status') {
+        // Detailed status endpoint
+        const stats = this.getSyncStats();
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          service: 'user-sync-service',
+          version: '1.0.0',
+          timestamp: new Date().toISOString(),
+          stats: stats
+        }, null, 2));
+
+      } else if (req.url === '/metrics') {
+        // Metrics endpoint (Prometheus-like format)
+        const stats = this.getSyncStats();
+        res.setHeader('Content-Type', 'text/plain');
+        res.writeHead(200);
+        res.end(`# HELP sync_total_synced Total number of users synced
+# TYPE sync_total_synced counter
+sync_total_synced ${stats.totalSynced}
+
+# HELP sync_errors Total number of sync errors
+# TYPE sync_errors counter
+sync_errors ${stats.errors}
+
+# HELP sync_consecutive_failures Consecutive sync failures
+# TYPE sync_consecutive_failures gauge
+sync_consecutive_failures ${stats.consecutiveFailures}
+
+# HELP sync_realtime_active Real-time sync status (1=active, 0=inactive)
+# TYPE sync_realtime_active gauge
+sync_realtime_active ${stats.realtimeSyncActive ? 1 : 0}
+
+# HELP sync_scheduled_active Scheduled sync status (1=active, 0=inactive)
+# TYPE sync_scheduled_active gauge
+sync_scheduled_active ${stats.scheduledSyncActive ? 1 : 0}
+
+# HELP sync_last_duration_seconds Last sync duration in seconds
+# TYPE sync_last_duration_seconds gauge
+sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
+`);
+
+      } else {
+        // 404 for unknown endpoints
+        res.writeHead(404);
+        res.end(JSON.stringify({
+          error: 'Not Found',
+          endpoints: ['/health', '/status', '/metrics']
+        }, null, 2));
+      }
+    });
+
+    this.httpServer.listen(port, () => {
+      this.log('SUCCESS', `HTTP server listening on port ${port}`);
+      this.log('INFO', `  Health check: http://localhost:${port}/health`);
+      this.log('INFO', `  Status: http://localhost:${port}/status`);
+      this.log('INFO', `  Metrics: http://localhost:${port}/metrics`);
+    });
+
+    this.httpServer.on('error', (err) => {
+      this.log('ERROR', `HTTP server error: ${err.message}`);
+    });
+  }
+
   // Complete setup method
   async setup() {
     this.log('INFO', '🚀 Setting up User Table Sync Service...');
@@ -1030,6 +1118,9 @@ class UserTableSyncService {
       this.log('SUCCESS', 'User Table Sync Service is running!');
       this.log('INFO', `  Real-time sync: ${this.isListening ? 'Active' : 'Inactive'}`);
       this.log('INFO', `  Scheduled sync: Every ${this.syncIntervalMinutes} minute(s)`);
+
+      // 5. Start HTTP server for health checks
+      this.startHttpServer();
 
       // Setup graceful shutdown handler
       this.setupGracefulShutdown();
@@ -1085,14 +1176,24 @@ class UserTableSyncService {
           }
         }
 
-        // 4. Close connection pools
+        // 4. Close HTTP server
+        if (this.httpServer) {
+          await new Promise((resolve) => {
+            this.httpServer.close(() => {
+              this.log('SUCCESS', 'HTTP server closed');
+              resolve();
+            });
+          });
+        }
+
+        // 5. Close connection pools
         await Promise.all([
           this.sourcePool.end(),
           this.chatPool.end()
         ]);
         this.log('SUCCESS', 'Database connection pools closed');
 
-        // 5. Display final stats
+        // 6. Display final stats
         const stats = this.getSyncStats();
         this.log('INFO', 'Final statistics:', { details: stats });
 
