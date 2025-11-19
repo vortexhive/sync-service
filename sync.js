@@ -1,36 +1,87 @@
 // userTableSync.js - Complete sync service for source -> chat database
-const { Client } = require('pg');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 class UserTableSyncService {
   constructor() {
-    // Source database config
+    // Source database config with connection pooling
     this.sourceDbConfig = {
       host: process.env.SOURCE_DB_HOST || 'localhost',
       port: parseInt(process.env.SOURCE_DB_PORT) || 5432,
       database: process.env.SOURCE_DB_NAME || 'myusta_backend',
       user: process.env.SOURCE_DB_USER || 'postgres',
-      password: process.env.SOURCE_DB_PASSWORD
+      password: process.env.SOURCE_DB_PASSWORD,
+      max: parseInt(process.env.SOURCE_DB_POOL_SIZE) || 10, // Connection pool size
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
     };
 
-    // Destination database config (chat app)
+    // Destination database config (chat app) with connection pooling
     this.chatDbConfig = {
       host: process.env.CHAT_DB_HOST || 'localhost',
       port: parseInt(process.env.CHAT_DB_PORT) || 5432,
       database: process.env.CHAT_DB_NAME || 'myusta_chatapp',
       user: process.env.CHAT_DB_USER || 'postgres',
-      password: process.env.CHAT_DB_PASSWORD
+      password: process.env.CHAT_DB_PASSWORD,
+      max: parseInt(process.env.CHAT_DB_POOL_SIZE) || 10, // Connection pool size
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
     };
 
+    // Initialize connection pools
+    this.sourcePool = new Pool(this.sourceDbConfig);
+    this.chatPool = new Pool(this.chatDbConfig);
+
+    // Real-time sync client (separate from pool)
+    this.realtimeClient = null;
+    this.realtimeReconnectAttempts = 0;
+    this.maxReconnectAttempts = parseInt(process.env.MAX_RECONNECT_ATTEMPTS) || 10;
+    this.realtimeReconnectTimeout = null;
+
+    // Sync state management
     this.isListening = false;
+    this.isSyncInProgress = false; // Mutex for preventing concurrent syncs
+    this.scheduledSyncTimeout = null;
+
     this.syncStats = {
       totalSynced: 0,
       lastSyncTime: null,
-      errors: 0
+      lastSyncDuration: null,
+      errors: 0,
+      consecutiveFailures: 0,
+      lastError: null,
+      realtimeSyncActive: false,
+      scheduledSyncActive: false
     };
+
+    // Configuration
+    this.retryConfig = {
+      maxRetries: parseInt(process.env.MAX_RETRIES) || 3,
+      initialDelayMs: parseInt(process.env.RETRY_INITIAL_DELAY) || 1000,
+      maxDelayMs: parseInt(process.env.RETRY_MAX_DELAY) || 30000,
+      backoffMultiplier: parseFloat(process.env.RETRY_BACKOFF_MULTIPLIER) || 2
+    };
+
+    this.syncIntervalMinutes = parseInt(process.env.SYNC_INTERVAL_MINUTES) || 1;
+    this.syncWindowMultiplier = parseInt(process.env.SYNC_WINDOW_MULTIPLIER) || 3; // Look back 3x interval
 
     // Validate required environment variables
     this.validateConfig();
+
+    // Setup pool error handlers
+    this.setupPoolErrorHandlers();
+  }
+
+  setupPoolErrorHandlers() {
+    this.sourcePool.on('error', (err) => {
+      console.error('❌ Unexpected error on source database pool:', err);
+      this.logError('POOL_ERROR', null, err);
+    });
+
+    this.chatPool.on('error', (err) => {
+      console.error('❌ Unexpected error on chat database pool:', err);
+      this.logError('POOL_ERROR', null, err);
+    });
   }
 
   validateConfig() {
@@ -40,7 +91,7 @@ class UserTableSyncService {
     ];
 
     const missing = requiredVars.filter(varName => !process.env[varName]);
-    
+
     if (missing.length > 0) {
       console.error('❌ Missing required environment variables:');
       missing.forEach(varName => console.error(`   - ${varName}`));
@@ -50,8 +101,103 @@ class UserTableSyncService {
 
     // Log configuration (without passwords)
     console.log('🔧 Database Configuration:');
-    console.log(`   Source: ${this.sourceDbConfig.user}@${this.sourceDbConfig.host}:${this.sourceDbConfig.port}/${this.sourceDbConfig.database}`);
-    console.log(`   Chat: ${this.chatDbConfig.user}@${this.chatDbConfig.host}:${this.chatDbConfig.port}/${this.chatDbConfig.database}`);
+    console.log(`   Source: ${this.sourceDbConfig.user}@${this.sourceDbConfig.host}:${this.sourceDbConfig.port}/${this.sourceDbConfig.database} (Pool: ${this.sourceDbConfig.max})`);
+    console.log(`   Chat: ${this.chatDbConfig.user}@${this.chatDbConfig.host}:${this.chatDbConfig.port}/${this.chatDbConfig.database} (Pool: ${this.chatDbConfig.max})`);
+    console.log(`   Sync Interval: ${this.syncIntervalMinutes} minute(s)`);
+    console.log(`   Sync Window: ${this.syncIntervalMinutes * this.syncWindowMultiplier} minute(s) lookback`);
+  }
+
+  // Structured logging helper
+  log(level, message, metadata = {}) {
+    const timestamp = new Date().toISOString();
+
+    const prefix = {
+      'INFO': 'ℹ️',
+      'SUCCESS': '✅',
+      'WARNING': '⚠️',
+      'ERROR': '❌',
+      'DEBUG': '🔍'
+    }[level] || 'ℹ️';
+
+    console.log(`${prefix} [${timestamp}] ${message}`, metadata.details ? JSON.stringify(metadata.details, null, 2) : '');
+  }
+
+  // Error logging with persistence
+  async logError(errorType, userId, error, additionalData = {}) {
+    const errorRecord = {
+      timestamp: new Date(),
+      errorType,
+      userId,
+      errorMessage: error.message || String(error),
+      errorStack: error.stack || null,
+      ...additionalData
+    };
+
+    // Log to console
+    this.log('ERROR', `${errorType}: ${errorRecord.errorMessage}`, { userId, ...additionalData });
+
+    // Persist to database
+    try {
+      await this.chatPool.query(`
+        INSERT INTO sync_errors (
+          error_type, user_id, error_message, error_stack,
+          additional_data, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+      `, [
+        errorType,
+        userId,
+        errorRecord.errorMessage,
+        errorRecord.errorStack,
+        JSON.stringify(additionalData),
+        errorRecord.timestamp
+      ]);
+    } catch (dbError) {
+      // Fallback if error table doesn't exist yet
+      console.error('Failed to persist error to database:', dbError.message);
+    }
+
+    // Update stats
+    this.syncStats.errors++;
+    this.syncStats.consecutiveFailures++;
+    this.syncStats.lastError = errorRecord;
+  }
+
+  // Retry logic with exponential backoff
+  async retryWithBackoff(operation, context = '') {
+    let lastError;
+
+    for (let attempt = 0; attempt <= this.retryConfig.maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delay = Math.min(
+            this.retryConfig.initialDelayMs * Math.pow(this.retryConfig.backoffMultiplier, attempt - 1),
+            this.retryConfig.maxDelayMs
+          );
+          this.log('WARNING', `Retry attempt ${attempt}/${this.retryConfig.maxRetries} for ${context} after ${delay}ms`);
+          await this.sleep(delay);
+        }
+
+        const result = await operation();
+
+        // Reset consecutive failures on success
+        if (attempt > 0) {
+          this.log('SUCCESS', `${context} succeeded after ${attempt} retry attempts`);
+        }
+        this.syncStats.consecutiveFailures = 0;
+
+        return result;
+      } catch (error) {
+        lastError = error;
+        this.log('WARNING', `${context} failed (attempt ${attempt + 1}/${this.retryConfig.maxRetries + 1}): ${error.message}`);
+      }
+    }
+
+    throw lastError;
+  }
+
+  // Sleep helper
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   // Transform source user data to chat user format
@@ -162,18 +308,15 @@ class UserTableSyncService {
 
   // Sync ALL users from source to chat (complete refresh)
   async syncAllUsers() {
-    const sourceClient = new Client(this.sourceDbConfig);
-    const chatClient = new Client(this.chatDbConfig);
-    
-    try {
-      await sourceClient.connect();
-      await chatClient.connect();
+    const startTime = Date.now();
+    this.log('INFO', 'Starting complete sync of ALL users...');
 
-      console.log('📊 Getting total user count...');
-      const countResult = await sourceClient.query("SELECT COUNT(*) as count FROM users WHERE status = 'active'");
+    try {
+      this.log('INFO', 'Getting total user count...');
+      const countResult = await this.sourcePool.query("SELECT COUNT(*) as count FROM users WHERE status = 'active'");
       const totalUsers = parseInt(countResult.rows[0].count);
-      
-      console.log(`📋 Found ${totalUsers.toLocaleString()} active users to sync`);
+
+      this.log('INFO', `Found ${totalUsers.toLocaleString()} active users to sync`);
 
       const limit = 1000;
       let offset = 0;
@@ -181,24 +324,24 @@ class UserTableSyncService {
       let totalErrors = 0;
 
       while (offset < totalUsers) {
-        console.log(`\n🔄 Processing batch ${Math.floor(offset/limit) + 1} (${offset + 1}-${Math.min(offset + limit, totalUsers)} of ${totalUsers})...`);
-        
+        this.log('INFO', `Processing batch ${Math.floor(offset/limit) + 1} (${offset + 1}-${Math.min(offset + limit, totalUsers)} of ${totalUsers})...`);
+
         const query = `
-          SELECT 
-            id, first_name, last_name, email, phone, email_verified, 
-            phone_verified, password, auth_provider, google_id, facebook_id, 
-            role, status, customer_preferences, profile_picture, 
-            notification_via_app, notification_via_email, notification_via_sms, 
-            terms_and_conditions, average_rating, total_ratings, total_hires, 
-            total_views, last_hired_at, is_verified, is_featured, search_boost, 
+          SELECT
+            id, first_name, last_name, email, phone, email_verified,
+            phone_verified, password, auth_provider, google_id, facebook_id,
+            role, status, customer_preferences, profile_picture,
+            notification_via_app, notification_via_email, notification_via_sms,
+            terms_and_conditions, average_rating, total_ratings, total_hires,
+            total_views, last_hired_at, is_verified, is_featured, search_boost,
             created_at, updated_at, bio
-          FROM users 
+          FROM users
           WHERE status = 'active' AND id IS NOT NULL
           ORDER BY id
           LIMIT $1 OFFSET $2
         `;
 
-        const result = await sourceClient.query(query, [limit, offset]);
+        const result = await this.sourcePool.query(query, [limit, offset]);
         const users = result.rows;
 
         let batchSynced = 0;
@@ -206,12 +349,193 @@ class UserTableSyncService {
 
         for (const user of users) {
           try {
+            await this.retryWithBackoff(async () => {
+              const transformedUser = this.transformUserData(user);
+
+              await this.chatPool.query(`
+                INSERT INTO users (
+                  id, "externalId", name, phone, email, role, "socketId",
+                  "isOnline", "lastSeen", avatar, "metaData", "createdAt",
+                  "updatedAt", "firstName", "lastName"
+                ) VALUES (
+                  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+                )
+                ON CONFLICT ("externalId") DO UPDATE SET
+                  name = EXCLUDED.name,
+                  phone = EXCLUDED.phone,
+                  email = EXCLUDED.email,
+                  role = EXCLUDED.role,
+                  avatar = EXCLUDED.avatar,
+                  "metaData" = EXCLUDED."metaData",
+                  "updatedAt" = EXCLUDED."updatedAt",
+                  "firstName" = EXCLUDED."firstName",
+                  "lastName" = EXCLUDED."lastName"
+              `, [
+                transformedUser.id,
+                transformedUser.externalId,
+                transformedUser.name,
+                transformedUser.phone,
+                transformedUser.email,
+                transformedUser.role,
+                transformedUser.socketId,
+                transformedUser.isOnline,
+                transformedUser.lastSeen,
+                transformedUser.avatar,
+                JSON.stringify(transformedUser.metaData),
+                transformedUser.createdAt,
+                transformedUser.updatedAt,
+                transformedUser.firstName,
+                transformedUser.lastName
+              ]);
+            }, `sync user ${user.id}`);
+
+            batchSynced++;
+          } catch (error) {
+            await this.logError('SYNC_USER_FAILED', user.id, error, {
+              userName: `${user.first_name} ${user.last_name}`,
+              userEmail: user.email
+            });
+            batchErrors++;
+          }
+        }
+
+        totalSynced += batchSynced;
+        totalErrors += batchErrors;
+
+        this.log('SUCCESS', `Batch completed: ${batchSynced} synced, ${batchErrors} errors`);
+        this.log('INFO', `Progress: ${totalSynced}/${totalUsers} users (${Math.round((totalSynced/totalUsers)*100)}%)`);
+
+        offset += limit;
+      }
+
+      this.syncStats.totalSynced += totalSynced;
+      this.syncStats.errors += totalErrors;
+      this.syncStats.lastSyncTime = new Date();
+      this.syncStats.lastSyncDuration = Date.now() - startTime;
+
+      this.log('SUCCESS', `ALL USERS SYNC COMPLETED! Synced: ${totalSynced.toLocaleString()}, Errors: ${totalErrors.toLocaleString()}, Duration: ${Math.round(this.syncStats.lastSyncDuration / 1000)}s`);
+
+      return { synced: totalSynced, errors: totalErrors };
+
+    } catch (error) {
+      await this.logError('COMPLETE_SYNC_FAILED', null, error);
+      throw error;
+    }
+  }
+
+  // Upsert single user to chat database (used by real-time sync)
+  async upsertUser(userData) {
+    try {
+      return await this.retryWithBackoff(async () => {
+        const transformedUser = this.transformUserData(userData);
+
+        const query = `
+          INSERT INTO users (
+            id, "externalId", name, phone, email, role, "socketId",
+            "isOnline", "lastSeen", avatar, "metaData", "createdAt",
+            "updatedAt", "firstName", "lastName"
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+          )
+          ON CONFLICT ("externalId") DO UPDATE SET
+            name = EXCLUDED.name,
+            phone = EXCLUDED.phone,
+            email = EXCLUDED.email,
+            role = EXCLUDED.role,
+            avatar = EXCLUDED.avatar,
+            "metaData" = EXCLUDED."metaData",
+            "updatedAt" = EXCLUDED."updatedAt",
+            "firstName" = EXCLUDED."firstName",
+            "lastName" = EXCLUDED."lastName"
+          RETURNING id;
+        `;
+
+        const values = [
+          transformedUser.id,
+          transformedUser.externalId,
+          transformedUser.name,
+          transformedUser.phone,
+          transformedUser.email,
+          transformedUser.role,
+          transformedUser.socketId,
+          transformedUser.isOnline,
+          transformedUser.lastSeen,
+          transformedUser.avatar,
+          JSON.stringify(transformedUser.metaData),
+          transformedUser.createdAt,
+          transformedUser.updatedAt,
+          transformedUser.firstName,
+          transformedUser.lastName
+        ];
+
+        const result = await this.chatPool.query(query, values);
+
+        this.log('SUCCESS', `User synced: ${transformedUser.name} (${transformedUser.id})`);
+        this.syncStats.totalSynced++;
+
+        return result.rows[0];
+      }, `upsert user ${userData.id}`);
+
+    } catch (error) {
+      await this.logError('UPSERT_USER_FAILED', userData.id, error, {
+        userName: `${userData.first_name} ${userData.last_name}`,
+        userEmail: userData.email,
+        userPhone: userData.phone
+      });
+      throw error;
+    }
+  }
+
+  // Bulk sync users with pagination
+  async bulkSyncUsers(limit = 1000, offset = 0, sinceDate = null) {
+    try {
+      // Build query with optional date filter - only sync active users with valid data
+      let whereClause = "WHERE status = 'active' AND id IS NOT NULL";
+      const queryParams = [limit, offset];
+
+      if (sinceDate) {
+        whereClause += " AND updated_at > $3";
+        queryParams.push(sinceDate);
+      }
+
+      const query = `
+        SELECT
+          id, first_name, last_name, email, phone, email_verified,
+          phone_verified, password, auth_provider, google_id, facebook_id,
+          role, status, customer_preferences, profile_picture,
+          notification_via_app, notification_via_email, notification_via_sms,
+          terms_and_conditions, average_rating, total_ratings, total_hires,
+          total_views, last_hired_at, is_verified, is_featured, search_boost,
+          created_at, updated_at, bio
+        FROM users
+        ${whereClause}
+        ORDER BY updated_at DESC
+        LIMIT $1 OFFSET $2
+      `;
+
+      const result = await this.sourcePool.query(query, queryParams);
+      const users = result.rows;
+
+      if (users.length === 0) {
+        this.log('INFO', 'No users to sync');
+        return false;
+      }
+
+      this.log('INFO', `Syncing ${users.length} users (offset: ${offset})...`);
+
+      // Batch upsert users
+      let successCount = 0;
+      let errorCount = 0;
+
+      for (const user of users) {
+        try {
+          await this.retryWithBackoff(async () => {
             const transformedUser = this.transformUserData(user);
-            
-            await chatClient.query(`
+
+            await this.chatPool.query(`
               INSERT INTO users (
-                id, "externalId", name, phone, email, role, "socketId", 
-                "isOnline", "lastSeen", avatar, "metaData", "createdAt", 
+                id, "externalId", name, phone, email, role, "socketId",
+                "isOnline", "lastSeen", avatar, "metaData", "createdAt",
                 "updatedAt", "firstName", "lastName"
               ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
@@ -243,204 +567,19 @@ class UserTableSyncService {
               transformedUser.firstName,
               transformedUser.lastName
             ]);
-            
-            batchSynced++;
-          } catch (error) {
-            console.error(`❌ Error syncing user ${user.id}: ${error.message}`);
-            batchErrors++;
-          }
-        }
+          }, `bulk sync user ${user.id}`);
 
-        totalSynced += batchSynced;
-        totalErrors += batchErrors;
-        
-        console.log(`   ✅ Batch completed: ${batchSynced} synced, ${batchErrors} errors`);
-        console.log(`   📊 Progress: ${totalSynced}/${totalUsers} users (${Math.round((totalSynced/totalUsers)*100)}%)`);
-        
-        offset += limit;
-      }
-
-      this.syncStats.totalSynced += totalSynced;
-      this.syncStats.errors += totalErrors;
-      this.syncStats.lastSyncTime = new Date();
-
-      console.log(`\n🎉 ALL USERS SYNC COMPLETED!`);
-      console.log(`   ✅ Successfully synced: ${totalSynced.toLocaleString()}`);
-      console.log(`   ❌ Errors: ${totalErrors.toLocaleString()}`);
-      console.log(`   📊 Success rate: ${Math.round((totalSynced/(totalSynced+totalErrors))*100)}%`);
-
-      return { synced: totalSynced, errors: totalErrors };
-
-    } catch (error) {
-      console.error('❌ Complete sync error:', error);
-      throw error;
-    } finally {
-      await sourceClient.end();
-      await chatClient.end();
-    }
-  }
-
-  // Upsert single user to chat database
-  async upsertUser(userData) {
-    const chatClient = new Client(this.chatDbConfig);
-    
-    try {
-      await chatClient.connect();
-      
-      const transformedUser = this.transformUserData(userData);
-      
-      const query = `
-        INSERT INTO users (
-          id, "externalId", name, phone, email, role, "socketId", 
-          "isOnline", "lastSeen", avatar, "metaData", "createdAt", 
-          "updatedAt", "firstName", "lastName"
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
-        )
-        ON CONFLICT ("externalId") DO UPDATE SET
-          name = EXCLUDED.name,
-          phone = EXCLUDED.phone,
-          email = EXCLUDED.email,
-          role = EXCLUDED.role,
-          avatar = EXCLUDED.avatar,
-          "metaData" = EXCLUDED."metaData",
-          "updatedAt" = EXCLUDED."updatedAt",
-          "firstName" = EXCLUDED."firstName",
-          "lastName" = EXCLUDED."lastName"
-        RETURNING id;
-      `;
-
-      const values = [
-        transformedUser.id,
-        transformedUser.externalId,
-        transformedUser.name,
-        transformedUser.phone,
-        transformedUser.email,
-        transformedUser.role,
-        transformedUser.socketId,
-        transformedUser.isOnline,
-        transformedUser.lastSeen,
-        transformedUser.avatar,
-        JSON.stringify(transformedUser.metaData),
-        transformedUser.createdAt,
-        transformedUser.updatedAt,
-        transformedUser.firstName,
-        transformedUser.lastName
-      ];
-
-      const result = await chatClient.query(query, values);
-      
-      console.log(`✅ User synced: ${transformedUser.name} (${transformedUser.id})`);
-      this.syncStats.totalSynced++;
-      
-      return result.rows[0];
-
-    } catch (error) {
-      console.error(`❌ Error syncing user ${userData.id}:`, error.message);
-      console.error(`   User data: name="${userData.first_name} ${userData.last_name}", phone="${userData.phone}", email="${userData.email}"`);
-      this.syncStats.errors++;
-      throw error;
-    } finally {
-      await chatClient.end();
-    }
-  }
-
-  // Bulk sync users with pagination
-  async bulkSyncUsers(limit = 1000, offset = 0, sinceDate = null) {
-    const sourceClient = new Client(this.sourceDbConfig);
-    const chatClient = new Client(this.chatDbConfig);
-    
-    try {
-      await sourceClient.connect();
-      await chatClient.connect();
-      
-      // Build query with optional date filter - only sync active users with valid data
-      let whereClause = "WHERE status = 'active' AND id IS NOT NULL"; 
-      const queryParams = [limit, offset];
-      
-      if (sinceDate) {
-        whereClause += " AND updated_at > $3";
-        queryParams.push(sinceDate);
-      }
-
-      const query = `
-        SELECT 
-          id, first_name, last_name, email, phone, email_verified, 
-          phone_verified, password, auth_provider, google_id, facebook_id, 
-          role, status, customer_preferences, profile_picture, 
-          notification_via_app, notification_via_email, notification_via_sms, 
-          terms_and_conditions, average_rating, total_ratings, total_hires, 
-          total_views, last_hired_at, is_verified, is_featured, search_boost, 
-          created_at, updated_at, bio
-        FROM users 
-        ${whereClause}
-        ORDER BY updated_at DESC
-        LIMIT $1 OFFSET $2
-      `;
-
-      const result = await sourceClient.query(query, queryParams);
-      const users = result.rows;
-
-      if (users.length === 0) {
-        console.log('📋 No users to sync');
-        return false;
-      }
-
-      console.log(`🔄 Syncing ${users.length} users (offset: ${offset})...`);
-
-      // Batch upsert users
-      let successCount = 0;
-      let errorCount = 0;
-
-      for (const user of users) {
-        try {
-          const transformedUser = this.transformUserData(user);
-          
-          await chatClient.query(`
-            INSERT INTO users (
-              id, "externalId", name, phone, email, role, "socketId", 
-              "isOnline", "lastSeen", avatar, "metaData", "createdAt", 
-              "updatedAt", "firstName", "lastName"
-            ) VALUES (
-              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
-            )
-            ON CONFLICT ("externalId") DO UPDATE SET
-              name = EXCLUDED.name,
-              phone = EXCLUDED.phone,
-              email = EXCLUDED.email,
-              role = EXCLUDED.role,
-              avatar = EXCLUDED.avatar,
-              "metaData" = EXCLUDED."metaData",
-              "updatedAt" = EXCLUDED."updatedAt",
-              "firstName" = EXCLUDED."firstName",
-              "lastName" = EXCLUDED."lastName"
-          `, [
-            transformedUser.id,
-            transformedUser.externalId,
-            transformedUser.name,
-            transformedUser.phone,
-            transformedUser.email,
-            transformedUser.role,
-            transformedUser.socketId,
-            transformedUser.isOnline,
-            transformedUser.lastSeen,
-            transformedUser.avatar,
-            JSON.stringify(transformedUser.metaData),
-            transformedUser.createdAt,
-            transformedUser.updatedAt,
-            transformedUser.firstName,
-            transformedUser.lastName
-          ]);
-          
           successCount++;
         } catch (error) {
-          console.error(`❌ Error syncing user ${user.id}:`, error.message);
-          console.error(`   User data: name="${user.first_name} ${user.last_name}", phone="${user.phone}", email="${user.email}"`);
+          await this.logError('BULK_SYNC_USER_FAILED', user.id, error, {
+            userName: `${user.first_name} ${user.last_name}`,
+            userEmail: user.email
+          });
           errorCount++;
         }
       }
 
-      console.log(`✅ Batch sync completed: ${successCount} success, ${errorCount} errors`);
+      this.log('SUCCESS', `Batch sync completed: ${successCount} success, ${errorCount} errors`);
       this.syncStats.totalSynced += successCount;
       this.syncStats.errors += errorCount;
       this.syncStats.lastSyncTime = new Date();
@@ -448,25 +587,38 @@ class UserTableSyncService {
       return users.length === limit; // Return true if there might be more records
 
     } catch (error) {
-      console.error('❌ Bulk sync error:', error);
+      await this.logError('BULK_SYNC_FAILED', null, error, { limit, offset, sinceDate });
       throw error;
-    } finally {
-      await sourceClient.end();
-      await chatClient.end();
     }
   }
 
-  // Real-time sync using PostgreSQL LISTEN/NOTIFY
+  // Real-time sync using PostgreSQL LISTEN/NOTIFY with auto-reconnection
   async startRealTimeSync() {
-    if (this.isListening) return;
-    
-    const sourceClient = new Client(this.sourceDbConfig);
-    
+    if (this.isListening) {
+      this.log('INFO', 'Real-time sync already active');
+      return;
+    }
+
     try {
-      await sourceClient.connect();
-      
+      // Clean up any existing client
+      if (this.realtimeClient) {
+        try {
+          await this.realtimeClient.end();
+        } catch (e) {
+          // Ignore errors from ending a potentially broken connection
+        }
+        this.realtimeClient = null;
+      }
+
+      // Create dedicated client for LISTEN (not from pool)
+      const { Client } = require('pg');
+      this.realtimeClient = new Client(this.sourceDbConfig);
+
+      await this.realtimeClient.connect();
+      this.log('SUCCESS', 'Real-time sync client connected');
+
       // Create trigger function if not exists
-      await sourceClient.query(`
+      await this.realtimeClient.query(`
         CREATE OR REPLACE FUNCTION notify_user_changes()
         RETURNS TRIGGER AS $$
         BEGIN
@@ -488,7 +640,7 @@ class UserTableSyncService {
       `);
 
       // Create trigger if not exists
-      await sourceClient.query(`
+      await this.realtimeClient.query(`
         DROP TRIGGER IF EXISTS user_changes_trigger ON users;
         CREATE TRIGGER user_changes_trigger
         AFTER INSERT OR UPDATE OR DELETE ON users
@@ -496,12 +648,13 @@ class UserTableSyncService {
       `);
 
       // Listen for notifications
-      await sourceClient.query('LISTEN user_changes');
-      
-      sourceClient.on('notification', async (msg) => {
+      await this.realtimeClient.query('LISTEN user_changes');
+
+      // Handle notifications
+      this.realtimeClient.on('notification', async (msg) => {
         try {
           const payload = JSON.parse(msg.payload);
-          
+
           if (payload.operation === 'DELETE') {
             // Handle user deletion
             await this.deleteUserFromChat(payload.id);
@@ -510,106 +663,308 @@ class UserTableSyncService {
             await this.upsertUser(payload.data);
           }
         } catch (error) {
-          console.error('❌ Error processing user change notification:', error);
+          await this.logError('REALTIME_NOTIFICATION_FAILED', payload?.data?.id || payload?.id, error);
+        }
+      });
+
+      // Handle connection errors and reconnect
+      this.realtimeClient.on('error', async (err) => {
+        this.log('ERROR', 'Real-time sync connection error', { details: err.message });
+        this.isListening = false;
+        this.syncStats.realtimeSyncActive = false;
+        await this.attemptRealtimeReconnection();
+      });
+
+      // Handle unexpected disconnections
+      this.realtimeClient.on('end', async () => {
+        if (this.isListening) {
+          this.log('WARNING', 'Real-time sync connection ended unexpectedly');
+          this.isListening = false;
+          this.syncStats.realtimeSyncActive = false;
+          await this.attemptRealtimeReconnection();
         }
       });
 
       this.isListening = true;
-      console.log('🔊 Real-time sync started - listening for user changes...');
+      this.syncStats.realtimeSyncActive = true;
+      this.realtimeReconnectAttempts = 0; // Reset on successful connection
+      this.log('SUCCESS', 'Real-time sync started - listening for user changes...');
 
     } catch (error) {
-      console.error('❌ Error setting up real-time sync:', error);
+      await this.logError('REALTIME_SYNC_START_FAILED', null, error);
+      await this.attemptRealtimeReconnection();
       throw error;
     }
   }
 
+  // Attempt to reconnect real-time sync with exponential backoff
+  async attemptRealtimeReconnection() {
+    if (this.realtimeReconnectAttempts >= this.maxReconnectAttempts) {
+      this.log('ERROR', `Real-time sync reconnection failed after ${this.maxReconnectAttempts} attempts. Manual intervention required.`);
+      return;
+    }
+
+    this.realtimeReconnectAttempts++;
+
+    const delay = Math.min(
+      this.retryConfig.initialDelayMs * Math.pow(this.retryConfig.backoffMultiplier, this.realtimeReconnectAttempts - 1),
+      this.retryConfig.maxDelayMs
+    );
+
+    this.log('WARNING', `Attempting to reconnect real-time sync (attempt ${this.realtimeReconnectAttempts}/${this.maxReconnectAttempts}) in ${delay}ms...`);
+
+    this.realtimeReconnectTimeout = setTimeout(async () => {
+      try {
+        await this.startRealTimeSync();
+      } catch (error) {
+        this.log('ERROR', `Reconnection attempt ${this.realtimeReconnectAttempts} failed: ${error.message}`);
+      }
+    }, delay);
+  }
+
   // Delete user from chat database
   async deleteUserFromChat(userId) {
-    const chatClient = new Client(this.chatDbConfig);
-    
     try {
-      await chatClient.connect();
-      
-      const result = await chatClient.query(`
-        DELETE FROM users WHERE "externalId" = $1 RETURNING id
-      `, [userId]);
+      await this.retryWithBackoff(async () => {
+        const result = await this.chatPool.query(`
+          DELETE FROM users WHERE "externalId" = $1 RETURNING id
+        `, [userId]);
 
-      if (result.rows.length > 0) {
-        console.log(`🗑️ User deleted from chat: ${userId}`);
-      }
+        if (result.rows.length > 0) {
+          this.log('SUCCESS', `User deleted from chat: ${userId}`);
+        }
+      }, `delete user ${userId}`);
 
     } catch (error) {
-      console.error(`❌ Error deleting user ${userId}:`, error);
-    } finally {
-      await chatClient.end();
+      await this.logError('DELETE_USER_FAILED', userId, error);
     }
   }
 
-  // Scheduled incremental sync
-  async startScheduledSync(intervalMinutes = 5) {
-    const syncInterval = setInterval(async () => {
+  // Scheduled incremental sync with mutex to prevent overlapping syncs
+  async startScheduledSync(intervalMinutes = null) {
+    // Use configured interval if not specified
+    intervalMinutes = intervalMinutes || this.syncIntervalMinutes;
+
+    const runScheduledSync = async () => {
+      const startTime = Date.now();
+
+      // Check if previous sync is still running
+      if (this.isSyncInProgress) {
+        this.log('WARNING', 'Previous sync still in progress, skipping this interval. Consider increasing sync interval.');
+        this.scheduleNextSync(intervalMinutes);
+        return;
+      }
+
       try {
-        const since = new Date(Date.now() - (intervalMinutes + 1) * 60 * 1000);
-        
-        console.log(`⏰ Running scheduled sync (since ${since.toISOString()})...`);
-        
+        this.isSyncInProgress = true;
+        this.syncStats.scheduledSyncActive = true;
+
+        // Look back 3x the interval to ensure overlap and catch any missed updates
+        const lookbackMinutes = intervalMinutes * this.syncWindowMultiplier;
+        const since = new Date(Date.now() - lookbackMinutes * 60 * 1000);
+
+        this.log('INFO', `Running scheduled sync (looking back ${lookbackMinutes} minutes to ${since.toISOString()})...`);
+
         let hasMore = true;
         let offset = 0;
         const limit = 500;
-        
+        let totalSyncedThisCycle = 0;
+
         while (hasMore) {
           hasMore = await this.bulkSyncUsers(limit, offset, since);
           offset += limit;
-        }
-        
-      } catch (error) {
-        console.error('❌ Scheduled sync error:', error);
-      }
-    }, intervalMinutes * 60 * 1000);
 
-    console.log(`⏰ Scheduled sync started (every ${intervalMinutes} minutes)`);
-    return syncInterval;
+          if (hasMore) {
+            totalSyncedThisCycle += limit;
+          } else {
+            totalSyncedThisCycle += (offset % limit);
+          }
+        }
+
+        const duration = Date.now() - startTime;
+        this.syncStats.lastSyncDuration = duration;
+
+        this.log('SUCCESS', `Scheduled sync completed in ${Math.round(duration / 1000)}s (${totalSyncedThisCycle} users processed)`);
+
+        // Check if sync is taking too long
+        if (duration > intervalMinutes * 60 * 1000 * 0.8) {
+          this.log('WARNING', `Sync duration (${Math.round(duration / 1000)}s) is close to interval (${intervalMinutes * 60}s). Consider increasing interval or optimizing sync process.`);
+        }
+
+      } catch (error) {
+        await this.logError('SCHEDULED_SYNC_FAILED', null, error);
+      } finally {
+        this.isSyncInProgress = false;
+        this.syncStats.scheduledSyncActive = false;
+
+        // Schedule next sync
+        this.scheduleNextSync(intervalMinutes);
+      }
+    };
+
+    this.log('SUCCESS', `Scheduled sync started (every ${intervalMinutes} minute(s), looking back ${intervalMinutes * this.syncWindowMultiplier} minutes)`);
+
+    // Start first sync after the interval
+    this.scheduledSyncTimeout = setTimeout(runScheduledSync, intervalMinutes * 60 * 1000);
   }
 
-  // Get sync statistics
+  // Helper to schedule the next sync iteration
+  scheduleNextSync(intervalMinutes) {
+    if (this.scheduledSyncTimeout) {
+      clearTimeout(this.scheduledSyncTimeout);
+    }
+
+    this.scheduledSyncTimeout = setTimeout(async () => {
+      await this.runScheduledSyncCycle(intervalMinutes);
+    }, intervalMinutes * 60 * 1000);
+  }
+
+  // Run a single scheduled sync cycle
+  async runScheduledSyncCycle(intervalMinutes) {
+    const startTime = Date.now();
+
+    // Check if previous sync is still running
+    if (this.isSyncInProgress) {
+      this.log('WARNING', 'Previous sync still in progress, skipping this interval. Consider increasing sync interval.');
+      this.scheduleNextSync(intervalMinutes);
+      return;
+    }
+
+    try {
+      this.isSyncInProgress = true;
+      this.syncStats.scheduledSyncActive = true;
+
+      // Look back 3x the interval to ensure overlap and catch any missed updates
+      const lookbackMinutes = intervalMinutes * this.syncWindowMultiplier;
+      const since = new Date(Date.now() - lookbackMinutes * 60 * 1000);
+
+      this.log('INFO', `Running scheduled sync (looking back ${lookbackMinutes} minutes to ${since.toISOString()})...`);
+
+      let hasMore = true;
+      let offset = 0;
+      const limit = 500;
+
+      while (hasMore) {
+        hasMore = await this.bulkSyncUsers(limit, offset, since);
+        if (hasMore) {
+          offset += limit;
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      this.syncStats.lastSyncDuration = duration;
+
+      this.log('SUCCESS', `Scheduled sync completed in ${Math.round(duration / 1000)}s`);
+
+      // Check if sync is taking too long (>80% of interval)
+      if (duration > intervalMinutes * 60 * 1000 * 0.8) {
+        this.log('WARNING', `Sync duration (${Math.round(duration / 1000)}s) is close to interval (${intervalMinutes * 60}s). Consider increasing interval or optimizing sync process.`);
+      }
+
+    } catch (error) {
+      await this.logError('SCHEDULED_SYNC_FAILED', null, error);
+    } finally {
+      this.isSyncInProgress = false;
+      this.syncStats.scheduledSyncActive = false;
+
+      // Schedule next sync
+      this.scheduleNextSync(intervalMinutes);
+    }
+  }
+
+  // Get sync statistics with enhanced health information
   getSyncStats() {
+    const timeSinceLastSync = this.syncStats.lastSyncTime ?
+      Math.round((Date.now() - this.syncStats.lastSyncTime.getTime()) / 1000) : null;
+
     return {
       ...this.syncStats,
       isRealTimeActive: this.isListening,
-      uptime: this.syncStats.lastSyncTime ? 
-        Math.round((Date.now() - this.syncStats.lastSyncTime.getTime()) / 1000) : null
+      isSyncInProgress: this.isSyncInProgress,
+      timeSinceLastSyncSeconds: timeSinceLastSync,
+      lastSyncDurationSeconds: this.syncStats.lastSyncDuration ?
+        Math.round(this.syncStats.lastSyncDuration / 1000) : null,
+      realtimeReconnectAttempts: this.realtimeReconnectAttempts,
+      healthStatus: this.getHealthStatus()
     };
+  }
+
+  // Health check method
+  getHealthStatus() {
+    const timeSinceLastSync = this.syncStats.lastSyncTime ?
+      (Date.now() - this.syncStats.lastSyncTime.getTime()) / 1000 : null;
+
+    // Consider unhealthy if:
+    // 1. No sync in last 10 minutes
+    // 2. Consecutive failures > 5
+    // 3. Real-time sync is down
+    const isHealthy =
+      this.syncStats.consecutiveFailures < 5 &&
+      (timeSinceLastSync === null || timeSinceLastSync < 600) &&
+      this.isListening;
+
+    return {
+      status: isHealthy ? 'HEALTHY' : 'UNHEALTHY',
+      checks: {
+        realtimeSyncActive: this.isListening,
+        scheduledSyncActive: this.syncStats.scheduledSyncActive || !this.isSyncInProgress,
+        recentSyncSuccess: timeSinceLastSync === null || timeSinceLastSync < 600,
+        lowErrorRate: this.syncStats.consecutiveFailures < 5
+      },
+      recommendations: this.getHealthRecommendations(isHealthy, timeSinceLastSync)
+    };
+  }
+
+  // Get health recommendations based on status
+  getHealthRecommendations(isHealthy, timeSinceLastSync) {
+    const recommendations = [];
+
+    if (!this.isListening) {
+      recommendations.push('Real-time sync is not active - check database connection and logs');
+    }
+
+    if (this.syncStats.consecutiveFailures >= 5) {
+      recommendations.push(`High consecutive failure count (${this.syncStats.consecutiveFailures}) - investigate error logs`);
+    }
+
+    if (timeSinceLastSync && timeSinceLastSync > 600) {
+      recommendations.push(`No successful sync in ${Math.round(timeSinceLastSync / 60)} minutes - check service health`);
+    }
+
+    if (this.syncStats.lastSyncDuration && this.syncStats.lastSyncDuration > this.syncIntervalMinutes * 60 * 1000 * 0.8) {
+      recommendations.push('Sync duration approaching interval time - consider increasing interval or optimizing queries');
+    }
+
+    if (isHealthy && recommendations.length === 0) {
+      recommendations.push('All systems operational');
+    }
+
+    return recommendations;
   }
 
   // Verify sync status
   async verifySyncStatus() {
-    const sourceClient = new Client(this.sourceDbConfig);
-    const chatClient = new Client(this.chatDbConfig);
-    
     try {
-      await sourceClient.connect();
-      await chatClient.connect();
-
       const [sourceCount, chatCount] = await Promise.all([
-        sourceClient.query("SELECT COUNT(*) as count FROM users WHERE status = 'active'"),
-        chatClient.query('SELECT COUNT(*) as count FROM users')
+        this.sourcePool.query("SELECT COUNT(*) as count FROM users WHERE status = 'active'"),
+        this.chatPool.query('SELECT COUNT(*) as count FROM users')
       ]);
 
       const sourceTotal = parseInt(sourceCount.rows[0].count);
       const chatTotal = parseInt(chatCount.rows[0].count);
-      
-      console.log(`📊 Sync Status: Source(${sourceTotal}) -> Chat(${chatTotal})`);
-      
+
+      this.log('INFO', `Sync Status: Source(${sourceTotal}) -> Chat(${chatTotal})`);
+
       // Check for recent discrepancies
       const [recentSource, recentChat] = await Promise.all([
-        sourceClient.query(`
-          SELECT COUNT(*) as count 
-          FROM users 
+        this.sourcePool.query(`
+          SELECT COUNT(*) as count
+          FROM users
           WHERE status = 'active' AND updated_at > NOW() - INTERVAL '1 hour'
         `),
-        chatClient.query(`
-          SELECT COUNT(*) as count 
-          FROM users 
+        this.chatPool.query(`
+          SELECT COUNT(*) as count
+          FROM users
           WHERE "updatedAt" > NOW() - INTERVAL '1 hour'
         `)
       ]);
@@ -618,80 +973,152 @@ class UserTableSyncService {
         parseInt(recentSource.rows[0].count) - parseInt(recentChat.rows[0].count)
       );
 
+      const difference = Math.abs(sourceTotal - chatTotal);
+      const consistent = difference <= 5; // Allow small variance
+
+      if (!consistent) {
+        this.log('WARNING', `Sync inconsistency detected: ${difference} users difference`);
+      }
+
       return {
         sourceCount: sourceTotal,
         chatCount: chatTotal,
-        difference: Math.abs(sourceTotal - chatTotal),
+        difference,
         recentDifference: recentDiff,
-        consistent: Math.abs(sourceTotal - chatTotal) <= 5 // Allow small variance
+        consistent,
+        timestamp: new Date().toISOString()
       };
 
     } catch (error) {
-      console.error('❌ Verification error:', error);
+      await this.logError('VERIFICATION_FAILED', null, error);
       return { error: error.message };
-    } finally {
-      await sourceClient.end();
-      await chatClient.end();
     }
   }
 
   // Complete setup method
   async setup() {
-    console.log('🚀 Setting up User Table Sync Service...');
-    
+    this.log('INFO', '🚀 Setting up User Table Sync Service...');
+
     try {
       // 1. Initial bulk sync
-      console.log('\n📦 Starting initial bulk sync...');
+      this.log('INFO', 'Starting initial bulk sync...');
       let hasMore = true;
       let offset = 0;
       const limit = 1000;
-      
+
       while (hasMore) {
         hasMore = await this.bulkSyncUsers(limit, offset);
         offset += limit;
-        
+
         if (hasMore) {
-          console.log(`   Progress: ${offset} users processed...`);
+          this.log('INFO', `Progress: ${offset} users processed...`);
         }
       }
-      
-      // 2. Sync any remaining missing users
-      console.log('\n🎯 Checking for missing users...');
-      await this.syncAllUsers();
-      
-      // 3. Start real-time sync
-      console.log('\n🔊 Starting real-time sync...');
+
+      // 2. Start real-time sync
+      this.log('INFO', 'Starting real-time sync...');
       await this.startRealTimeSync();
-      
-      // 4. Start scheduled backup sync
-      console.log('\n⏰ Starting scheduled sync...');
-      const syncInterval = await this.startScheduledSync(5);
-      
-      // 5. Initial verification
-      console.log('\n📊 Verifying sync status...');
+
+      // 3. Start scheduled backup sync
+      this.log('INFO', 'Starting scheduled sync...');
+      await this.startScheduledSync();
+
+      // 4. Initial verification
+      this.log('INFO', 'Verifying sync status...');
       await this.verifySyncStatus();
-      
-      console.log('\n✅ User Table Sync Service is running!');
-      console.log('   Real-time sync: Active');
-      console.log('   Scheduled sync: Every 5 minutes');
-      
-      // Graceful shutdown handler
-      process.on('SIGINT', async () => {
-        console.log('\n🛑 Shutting down sync service...');
-        clearInterval(syncInterval);
-        this.isListening = false;
-        
-        // Final stats
-        const stats = this.getSyncStats();
-        console.log('📊 Final stats:', stats);
-        
-        process.exit(0);
-      });
-      
+
+      this.log('SUCCESS', 'User Table Sync Service is running!');
+      this.log('INFO', `  Real-time sync: ${this.isListening ? 'Active' : 'Inactive'}`);
+      this.log('INFO', `  Scheduled sync: Every ${this.syncIntervalMinutes} minute(s)`);
+
+      // Setup graceful shutdown handler
+      this.setupGracefulShutdown();
+
     } catch (error) {
-      console.error('❌ Setup failed:', error);
+      await this.logError('SETUP_FAILED', null, error);
       process.exit(1);
     }
+  }
+
+  // Graceful shutdown handler
+  setupGracefulShutdown() {
+    const shutdown = async (signal) => {
+      this.log('WARNING', `\n${signal} received - shutting down sync service gracefully...`);
+
+      try {
+        // 1. Stop accepting new syncs
+        if (this.scheduledSyncTimeout) {
+          clearTimeout(this.scheduledSyncTimeout);
+          this.log('INFO', 'Cleared scheduled sync timeout');
+        }
+
+        if (this.realtimeReconnectTimeout) {
+          clearTimeout(this.realtimeReconnectTimeout);
+          this.log('INFO', 'Cleared reconnection timeout');
+        }
+
+        // 2. Wait for in-progress sync to complete (max 30 seconds)
+        if (this.isSyncInProgress) {
+          this.log('WARNING', 'Waiting for in-progress sync to complete (max 30s)...');
+          const maxWait = 30000;
+          const startWait = Date.now();
+
+          while (this.isSyncInProgress && (Date.now() - startWait) < maxWait) {
+            await this.sleep(1000);
+          }
+
+          if (this.isSyncInProgress) {
+            this.log('WARNING', 'Sync still in progress after 30s, forcing shutdown');
+          } else {
+            this.log('SUCCESS', 'In-progress sync completed');
+          }
+        }
+
+        // 3. Close real-time sync connection
+        this.isListening = false;
+        if (this.realtimeClient) {
+          try {
+            await this.realtimeClient.end();
+            this.log('SUCCESS', 'Real-time sync connection closed');
+          } catch (error) {
+            this.log('WARNING', `Error closing real-time client: ${error.message}`);
+          }
+        }
+
+        // 4. Close connection pools
+        await Promise.all([
+          this.sourcePool.end(),
+          this.chatPool.end()
+        ]);
+        this.log('SUCCESS', 'Database connection pools closed');
+
+        // 5. Display final stats
+        const stats = this.getSyncStats();
+        this.log('INFO', 'Final statistics:', { details: stats });
+
+        this.log('SUCCESS', 'Shutdown complete');
+        process.exit(0);
+
+      } catch (error) {
+        this.log('ERROR', `Error during shutdown: ${error.message}`);
+        process.exit(1);
+      }
+    };
+
+    // Handle different termination signals
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // Handle uncaught errors
+    process.on('uncaughtException', async (error) => {
+      await this.logError('UNCAUGHT_EXCEPTION', null, error);
+      await shutdown('UNCAUGHT_EXCEPTION');
+    });
+
+    process.on('unhandledRejection', async (reason, promise) => {
+      await this.logError('UNHANDLED_REJECTION', null, new Error(String(reason)), { promise: String(promise) });
+      await shutdown('UNHANDLED_REJECTION');
+    });
   }
 }
 

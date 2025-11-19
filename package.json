@@ -9,9 +9,10 @@
     "bulk": "node sync.js bulk",
     "verify": "node sync.js verify",
     "realtime": "node sync.js realtime",
-    "monitor": "node monitor.js stats",
-    "watch": "node monitor.js watch",
-    "health": "node monitor.js health",
+    "monitor": "node sync_monitor.js stats",
+    "watch": "node sync_monitor.js watch",
+    "health": "node sync_monitor.js health",
+    "setup": "bash setup.sh",
     "test": "node test.js"
   },
   "dependencies": {
