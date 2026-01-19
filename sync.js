@@ -276,6 +276,40 @@ class UserTableSyncService {
 
   // Build metadata object from source user fields
   buildMetaData(user) {
+    // Parse notification_preference JSON if string
+    let notificationPreference = user.notification_preference;
+    if (typeof notificationPreference === 'string') {
+      try {
+        notificationPreference = JSON.parse(notificationPreference);
+      } catch (e) {
+        notificationPreference = null;
+      }
+    }
+
+    // Build notification settings - prefer new structure, fallback to legacy
+    const notificationSettings = notificationPreference?.channels ? {
+      app: notificationPreference.channels.app ?? true,
+      email: notificationPreference.channels.email ?? true,
+      sms: notificationPreference.channels.sms ?? false
+    } : {
+      app: user.notification_via_app !== null ? user.notification_via_app : true,
+      email: user.notification_via_email !== null ? user.notification_via_email : true,
+      sms: user.notification_via_sms !== null ? user.notification_via_sms : false
+    };
+
+    // Default notification preference structure (used if none exists)
+    const defaultNotificationPreference = {
+      channels: notificationSettings,
+      categories: {
+        jobs: { enabled: true, channels: ['push', 'email'] },
+        activity: { enabled: true, channels: ['push', 'email'] },
+        contracts: { enabled: true, channels: ['push', 'email'] },
+        reminders: { enabled: true, channels: ['push'] },
+        chat: { enabled: true, channels: ['push'] }
+      },
+      events: {}
+    };
+
     return {
       emailVerified: user.email_verified || false,
       phoneVerified: user.phone_verified || false,
@@ -284,11 +318,13 @@ class UserTableSyncService {
       facebookId: user.facebook_id,
       status: user.status,
       customerPreferences: user.customer_preferences,
-      notificationSettings: {
-        app: user.notification_via_app !== null ? user.notification_via_app : true,
-        email: user.notification_via_email !== null ? user.notification_via_email : true,
-        sms: user.notification_via_sms !== null ? user.notification_via_sms : false
-      },
+
+      // Legacy field - kept for backward compatibility
+      notificationSettings,
+
+      // NEW: Full notification preferences with categories and events
+      notificationPreference: notificationPreference || defaultNotificationPreference,
+
       termsAccepted: user.terms_and_conditions || false,
       ratings: {
         average: user.average_rating || null,
@@ -333,6 +369,7 @@ class UserTableSyncService {
             phone_verified, password, auth_provider, google_id, facebook_id,
             role, status, customer_preferences, profile_picture,
             notification_via_app, notification_via_email, notification_via_sms,
+            notification_preference,
             terms_and_conditions, average_rating, total_ratings, total_hires,
             total_views, last_hired_at, is_verified, is_featured, search_boost,
             created_at, updated_at, bio
@@ -505,6 +542,7 @@ class UserTableSyncService {
           phone_verified, password, auth_provider, google_id, facebook_id,
           role, status, customer_preferences, profile_picture,
           notification_via_app, notification_via_email, notification_via_sms,
+          notification_preference,
           terms_and_conditions, average_rating, total_ratings, total_hires,
           total_views, last_hired_at, is_verified, is_featured, search_boost,
           created_at, updated_at, bio
