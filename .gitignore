@@ -78,3 +78,12 @@ keys.text
 # Deployment scripts
 deploy.sh
 *.deploy.sh
+
+# Environment files with credentials
+.env
+.env.production
+.env.local
+.env.*.local
+
+# Claude files
+.claude/
