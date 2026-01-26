@@ -264,13 +264,14 @@ class UserTableSyncService {
   mapRole(sourceRole) {
     const roleMapping = {
       'customer': 'customer',
+      'usta': 'usta',  // Direct mapping for 'usta' role
       'service_provider': 'usta',
       'provider': 'usta',
       'admin': 'administrator',
       'administrator': 'administrator',
       'super_admin': 'administrator'
     };
-    
+
     return roleMapping[sourceRole?.toLowerCase()] || 'customer';
   }
 
