@@ -305,10 +305,65 @@ class UserTableSyncService {
         jobs: { enabled: true, channels: ['push', 'email'] },
         activity: { enabled: true, channels: ['push', 'email'] },
         contracts: { enabled: true, channels: ['push', 'email'] },
+        payments: { enabled: true, channels: ['push', 'email'] },
+        security: { enabled: true, channels: ['push', 'email'] },
         reminders: { enabled: true, channels: ['push'] },
         chat: { enabled: true, channels: ['push'] }
       },
       events: {}
+    };
+
+    // Parse security_settings JSON if string
+    let securitySettings = user.security_settings;
+    if (typeof securitySettings === 'string') {
+      try {
+        securitySettings = JSON.parse(securitySettings);
+      } catch (e) {
+        securitySettings = null;
+      }
+    }
+
+    // Parse privacy_settings JSON if string
+    let privacySettings = user.privacy_settings;
+    if (typeof privacySettings === 'string') {
+      try {
+        privacySettings = JSON.parse(privacySettings);
+      } catch (e) {
+        privacySettings = null;
+      }
+    }
+
+    // Parse preferred_job_types JSON if string
+    let preferredJobTypes = user.preferred_job_types;
+    if (typeof preferredJobTypes === 'string') {
+      try {
+        preferredJobTypes = JSON.parse(preferredJobTypes);
+      } catch (e) {
+        preferredJobTypes = [];
+      }
+    }
+
+    // Parse job_budget JSON if string
+    let jobBudget = user.job_budget;
+    if (typeof jobBudget === 'string') {
+      try {
+        jobBudget = JSON.parse(jobBudget);
+      } catch (e) {
+        jobBudget = null;
+      }
+    }
+
+    // Default security settings (including loginAlerts)
+    const defaultSecuritySettings = {
+      twoFactorEnabled: false,
+      twoFactorMethods: { email: false, sms: false },
+      loginAlerts: { email: true, push: true, sms: false }
+    };
+
+    // Default privacy settings
+    const defaultPrivacySettings = {
+      showOnlineStatus: true,
+      lastSeenVisibility: 'everyone'
     };
 
     return {
@@ -318,6 +373,7 @@ class UserTableSyncService {
       googleId: user.google_id,
       facebookId: user.facebook_id,
       status: user.status,
+      accountStatus: user.account_status || 'active',
       customerPreferences: user.customer_preferences,
 
       // Legacy field - kept for backward compatibility
@@ -325,6 +381,16 @@ class UserTableSyncService {
 
       // NEW: Full notification preferences with categories and events
       notificationPreference: notificationPreference || defaultNotificationPreference,
+
+      // Security settings (includes loginAlerts for device login notifications)
+      securitySettings: securitySettings || defaultSecuritySettings,
+
+      // Privacy settings (online status visibility)
+      privacySettings: privacySettings || defaultPrivacySettings,
+
+      // Job preferences (for USTA matching)
+      preferredJobTypes: preferredJobTypes || [],
+      jobBudget: jobBudget || { min: 0, max: 500000, currency: 'ALL' },
 
       termsAccepted: user.terms_and_conditions || false,
       ratings: {
@@ -370,7 +436,8 @@ class UserTableSyncService {
             phone_verified, password, auth_provider, google_id, facebook_id,
             role, status, customer_preferences, profile_picture,
             notification_via_app, notification_via_email, notification_via_sms,
-            notification_preference,
+            notification_preference, security_settings, privacy_settings,
+            account_status, preferred_job_types, job_budget,
             terms_and_conditions, average_rating, total_ratings, total_hires,
             total_views, last_hired_at, is_verified, is_featured, search_boost,
             created_at, updated_at, bio
@@ -543,7 +610,8 @@ class UserTableSyncService {
           phone_verified, password, auth_provider, google_id, facebook_id,
           role, status, customer_preferences, profile_picture,
           notification_via_app, notification_via_email, notification_via_sms,
-          notification_preference,
+          notification_preference, security_settings, privacy_settings,
+          account_status, preferred_job_types, job_budget,
           terms_and_conditions, average_rating, total_ratings, total_hires,
           total_views, last_hired_at, is_verified, is_featured, search_boost,
           created_at, updated_at, bio
