@@ -218,7 +218,8 @@ class UserTableSyncService {
       createdAt: sourceUser.created_at,
       updatedAt: sourceUser.updated_at,
       firstName: sourceUser.first_name,
-      lastName: sourceUser.last_name
+      lastName: sourceUser.last_name,
+      preferredLanguage: sourceUser.preferred_language || 'sq' // Default to Albanian
     };
   }
 
@@ -406,7 +407,13 @@ class UserTableSyncService {
         searchBoost: user.search_boost || 0
       },
       bio: user.bio || null,
-      hasPassword: !!user.password
+      hasPassword: !!user.password,
+
+      // Auto-reply settings (BE_21) - for automated message responses
+      autoReply: {
+        enabled: user.auto_reply_enabled || false,
+        message: user.auto_reply_message || null
+      }
     };
   }
 
@@ -440,7 +447,8 @@ class UserTableSyncService {
             account_status, preferred_job_types, job_budget,
             terms_and_conditions, average_rating, total_ratings, total_hires,
             total_views, last_hired_at, is_verified, is_featured, search_boost,
-            created_at, updated_at, bio
+            created_at, updated_at, bio,
+            auto_reply_enabled, auto_reply_message, preferred_language
           FROM users
           WHERE status = 'active' AND id IS NOT NULL
           ORDER BY id
@@ -462,9 +470,9 @@ class UserTableSyncService {
                 INSERT INTO users (
                   id, "externalId", name, phone, email, role, "socketId",
                   "isOnline", "lastSeen", avatar, "metaData", "createdAt",
-                  "updatedAt", "firstName", "lastName"
+                  "updatedAt", "firstName", "lastName", "preferredLanguage"
                 ) VALUES (
-                  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+                  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
                 )
                 ON CONFLICT ("externalId") DO UPDATE SET
                   name = EXCLUDED.name,
@@ -475,7 +483,8 @@ class UserTableSyncService {
                   "metaData" = EXCLUDED."metaData",
                   "updatedAt" = EXCLUDED."updatedAt",
                   "firstName" = EXCLUDED."firstName",
-                  "lastName" = EXCLUDED."lastName"
+                  "lastName" = EXCLUDED."lastName",
+                  "preferredLanguage" = EXCLUDED."preferredLanguage"
               `, [
                 transformedUser.id,
                 transformedUser.externalId,
@@ -491,7 +500,8 @@ class UserTableSyncService {
                 transformedUser.createdAt,
                 transformedUser.updatedAt,
                 transformedUser.firstName,
-                transformedUser.lastName
+                transformedUser.lastName,
+                transformedUser.preferredLanguage
               ]);
             }, `sync user ${user.id}`);
 
@@ -539,9 +549,9 @@ class UserTableSyncService {
           INSERT INTO users (
             id, "externalId", name, phone, email, role, "socketId",
             "isOnline", "lastSeen", avatar, "metaData", "createdAt",
-            "updatedAt", "firstName", "lastName"
+            "updatedAt", "firstName", "lastName", "preferredLanguage"
           ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
           )
           ON CONFLICT ("externalId") DO UPDATE SET
             name = EXCLUDED.name,
@@ -552,7 +562,8 @@ class UserTableSyncService {
             "metaData" = EXCLUDED."metaData",
             "updatedAt" = EXCLUDED."updatedAt",
             "firstName" = EXCLUDED."firstName",
-            "lastName" = EXCLUDED."lastName"
+            "lastName" = EXCLUDED."lastName",
+            "preferredLanguage" = EXCLUDED."preferredLanguage"
           RETURNING id;
         `;
 
@@ -571,7 +582,8 @@ class UserTableSyncService {
           transformedUser.createdAt,
           transformedUser.updatedAt,
           transformedUser.firstName,
-          transformedUser.lastName
+          transformedUser.lastName,
+          transformedUser.preferredLanguage
         ];
 
         const result = await this.chatPool.query(query, values);
@@ -614,7 +626,8 @@ class UserTableSyncService {
           account_status, preferred_job_types, job_budget,
           terms_and_conditions, average_rating, total_ratings, total_hires,
           total_views, last_hired_at, is_verified, is_featured, search_boost,
-          created_at, updated_at, bio
+          created_at, updated_at, bio,
+          auto_reply_enabled, auto_reply_message, preferred_language
         FROM users
         ${whereClause}
         ORDER BY updated_at DESC
@@ -644,9 +657,9 @@ class UserTableSyncService {
               INSERT INTO users (
                 id, "externalId", name, phone, email, role, "socketId",
                 "isOnline", "lastSeen", avatar, "metaData", "createdAt",
-                "updatedAt", "firstName", "lastName"
+                "updatedAt", "firstName", "lastName", "preferredLanguage"
               ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
               )
               ON CONFLICT ("externalId") DO UPDATE SET
                 name = EXCLUDED.name,
@@ -657,7 +670,8 @@ class UserTableSyncService {
                 "metaData" = EXCLUDED."metaData",
                 "updatedAt" = EXCLUDED."updatedAt",
                 "firstName" = EXCLUDED."firstName",
-                "lastName" = EXCLUDED."lastName"
+                "lastName" = EXCLUDED."lastName",
+                "preferredLanguage" = EXCLUDED."preferredLanguage"
             `, [
               transformedUser.id,
               transformedUser.externalId,
@@ -673,7 +687,8 @@ class UserTableSyncService {
               transformedUser.createdAt,
               transformedUser.updatedAt,
               transformedUser.firstName,
-              transformedUser.lastName
+              transformedUser.lastName,
+              transformedUser.preferredLanguage
             ]);
           }, `bulk sync user ${user.id}`);
 
@@ -1222,6 +1237,17 @@ sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
       this.log('INFO', 'Verifying sync status...');
       await this.verifySyncStatus();
 
+      // 5. BE_30: Sync blocked_users (REVERSE: chat -> backend)
+      this.log('INFO', '🚫 Starting blocked_users reverse sync...');
+      try {
+        await this.syncBlockedUsers();
+        await this.startBlockedUsersRealTimeSync();
+        await this.verifyBlockedUsersSync();
+      } catch (blockedSyncError) {
+        // Don't fail startup if blocked_users sync fails (table might not exist yet)
+        this.log('WARNING', `🚫 Blocked users sync failed (may need migration): ${blockedSyncError.message}`);
+      }
+
       this.log('SUCCESS', 'User Table Sync Service is running!');
       this.log('INFO', `  Real-time sync: ${this.isListening ? 'Active' : 'Inactive'}`);
       this.log('INFO', `  Scheduled sync: Every ${this.syncIntervalMinutes} minute(s)`);
@@ -1316,6 +1342,231 @@ sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
     // Handle different termination signals
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+  }
+
+  // =============================================
+  // BE_30: BLOCKED USERS REVERSE SYNC
+  // Sync blocked_users FROM chat_app_02 TO myusta_backend_02
+  // =============================================
+
+  /**
+   * Sync all blocked_users from chat DB to backend DB
+   * This is the REVERSE direction - chat is the source of truth for blocking
+   */
+  async syncBlockedUsers() {
+    this.log('INFO', '🚫 Starting blocked_users reverse sync (chat -> backend)...');
+    const startTime = Date.now();
+
+    try {
+      // Get all blocked_users from chat database
+      const result = await this.chatPool.query(`
+        SELECT id, blocker_id, blocked_id, reason, created_at, updated_at
+        FROM blocked_users
+        ORDER BY created_at ASC
+      `);
+
+      const blockedUsers = result.rows;
+      this.log('INFO', `Found ${blockedUsers.length} blocked user records in chat DB`);
+
+      if (blockedUsers.length === 0) {
+        this.log('INFO', 'No blocked users to sync');
+        return { synced: 0, errors: 0 };
+      }
+
+      let synced = 0;
+      let errors = 0;
+
+      for (const record of blockedUsers) {
+        try {
+          await this.upsertBlockedUser(record);
+          synced++;
+        } catch (error) {
+          await this.logError('SYNC_BLOCKED_USER_FAILED', record.id, error, {
+            blockerId: record.blocker_id,
+            blockedId: record.blocked_id
+          });
+          errors++;
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      this.log('SUCCESS', `🚫 Blocked users sync completed: ${synced} synced, ${errors} errors in ${Math.round(duration / 1000)}s`);
+
+      return { synced, errors };
+
+    } catch (error) {
+      await this.logError('SYNC_BLOCKED_USERS_FAILED', null, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Upsert a single blocked_user record to backend database
+   */
+  async upsertBlockedUser(record) {
+    return await this.retryWithBackoff(async () => {
+      await this.sourcePool.query(`
+        INSERT INTO blocked_users (
+          id, blocker_id, blocked_id, reason, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (blocker_id, blocked_id) DO UPDATE SET
+          reason = EXCLUDED.reason,
+          updated_at = EXCLUDED.updated_at
+      `, [
+        record.id,
+        record.blocker_id,
+        record.blocked_id,
+        record.reason,
+        record.created_at,
+        record.updated_at
+      ]);
+
+      return record;
+    }, `upsert blocked_user ${record.id}`);
+  }
+
+  /**
+   * Delete a blocked_user record from backend database (for unblock)
+   */
+  async deleteBlockedUser(blockerId, blockedId) {
+    return await this.retryWithBackoff(async () => {
+      const result = await this.sourcePool.query(`
+        DELETE FROM blocked_users
+        WHERE blocker_id = $1 AND blocked_id = $2
+        RETURNING id
+      `, [blockerId, blockedId]);
+
+      if (result.rows.length > 0) {
+        this.log('SUCCESS', `Deleted blocked_user: blocker=${blockerId}, blocked=${blockedId}`);
+      }
+
+      return result.rows[0];
+    }, `delete blocked_user ${blockerId}->${blockedId}`);
+  }
+
+  /**
+   * Start real-time sync for blocked_users changes in chat DB
+   * Uses PostgreSQL LISTEN/NOTIFY
+   */
+  async startBlockedUsersRealTimeSync() {
+    this.log('INFO', '🚫 Starting real-time sync for blocked_users changes...');
+
+    try {
+      // Create a separate client for blocked_users listening
+      const { Client } = require('pg');
+      this.blockedUsersClient = new Client({
+        ...this.chatDbConfig,
+        statement_timeout: 0, // No timeout for LISTEN connection
+        keepAlive: true,
+        keepAliveInitialDelayMillis: 10000
+      });
+
+      await this.blockedUsersClient.connect();
+
+      // Create trigger function if not exists
+      await this.blockedUsersClient.query(`
+        CREATE OR REPLACE FUNCTION notify_blocked_users_changes()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          IF TG_OP = 'DELETE' THEN
+            PERFORM pg_notify('blocked_users_changes', json_build_object(
+              'operation', TG_OP,
+              'blocker_id', OLD.blocker_id,
+              'blocked_id', OLD.blocked_id,
+              'id', OLD.id
+            )::text);
+            RETURN OLD;
+          ELSE
+            PERFORM pg_notify('blocked_users_changes', json_build_object(
+              'operation', TG_OP,
+              'data', row_to_json(NEW)
+            )::text);
+            RETURN NEW;
+          END IF;
+        END;
+        $$ LANGUAGE plpgsql;
+      `);
+
+      // Create trigger if not exists
+      await this.blockedUsersClient.query(`
+        DROP TRIGGER IF EXISTS blocked_users_changes_trigger ON blocked_users;
+        CREATE TRIGGER blocked_users_changes_trigger
+        AFTER INSERT OR UPDATE OR DELETE ON blocked_users
+        FOR EACH ROW EXECUTE FUNCTION notify_blocked_users_changes();
+      `);
+
+      // Listen for notifications
+      await this.blockedUsersClient.query('LISTEN blocked_users_changes');
+
+      // Handle notifications
+      this.blockedUsersClient.on('notification', async (msg) => {
+        try {
+          const payload = JSON.parse(msg.payload);
+          this.log('INFO', `🚫 Blocked users change: ${payload.operation}`, {
+            details: payload.operation === 'DELETE'
+              ? { blockerId: payload.blocker_id, blockedId: payload.blocked_id }
+              : { blockerId: payload.data?.blocker_id, blockedId: payload.data?.blocked_id }
+          });
+
+          if (payload.operation === 'DELETE') {
+            // Handle unblock - delete from backend
+            await this.deleteBlockedUser(payload.blocker_id, payload.blocked_id);
+          } else {
+            // Handle block (INSERT) or update
+            await this.upsertBlockedUser(payload.data);
+          }
+        } catch (error) {
+          await this.logError('BLOCKED_USERS_NOTIFICATION_FAILED', null, error, { payload: msg.payload });
+        }
+      });
+
+      // Handle connection errors
+      this.blockedUsersClient.on('error', async (err) => {
+        this.log('ERROR', 'Blocked users real-time sync connection error', { details: err.message });
+        // Attempt reconnection after delay
+        setTimeout(() => this.startBlockedUsersRealTimeSync(), 5000);
+      });
+
+      this.log('SUCCESS', '🚫 Real-time sync for blocked_users started - listening for changes...');
+
+    } catch (error) {
+      await this.logError('BLOCKED_USERS_REALTIME_START_FAILED', null, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Verify blocked_users sync status
+   */
+  async verifyBlockedUsersSync() {
+    try {
+      const [chatCount, backendCount] = await Promise.all([
+        this.chatPool.query('SELECT COUNT(*) as count FROM blocked_users'),
+        this.sourcePool.query('SELECT COUNT(*) as count FROM blocked_users')
+      ]);
+
+      const chatTotal = parseInt(chatCount.rows[0].count);
+      const backendTotal = parseInt(backendCount.rows[0].count);
+      const difference = Math.abs(chatTotal - backendTotal);
+
+      this.log('INFO', `🚫 Blocked Users Sync Status: Chat(${chatTotal}) -> Backend(${backendTotal}), Diff: ${difference}`);
+
+      return {
+        chatCount: chatTotal,
+        backendCount: backendTotal,
+        difference,
+        consistent: difference === 0
+      };
+
+    } catch (error) {
+      // If blocked_users table doesn't exist in backend, that's expected initially
+      if (error.message.includes('relation "blocked_users" does not exist')) {
+        this.log('WARNING', '🚫 blocked_users table does not exist in backend - run migration first');
+        return { error: 'blocked_users table not found in backend' };
+      }
+      await this.logError('VERIFY_BLOCKED_USERS_FAILED', null, error);
+      return { error: error.message };
+    }
 
     // Handle uncaught errors
     process.on('uncaughtException', async (error) => {
@@ -1386,7 +1637,33 @@ if (require.main === module) {
           process.exit(1);
         });
       break;
-      
+
+    case 'sync-blocked':
+      console.log('🚫 Starting blocked_users reverse sync (chat -> backend)...');
+      syncService.syncBlockedUsers()
+        .then((result) => {
+          console.log(`✅ Blocked users sync finished: ${result.synced} synced, ${result.errors} errors`);
+          return syncService.verifyBlockedUsersSync();
+        })
+        .then(() => process.exit(0))
+        .catch(err => {
+          console.error(err);
+          process.exit(1);
+        });
+      break;
+
+    case 'verify-blocked':
+      syncService.verifyBlockedUsersSync()
+        .then((result) => {
+          console.log('🚫 Blocked users verification:', result);
+          process.exit(0);
+        })
+        .catch(err => {
+          console.error(err);
+          process.exit(1);
+        });
+      break;
+
     default:
       console.log(`
 🔄 User Table Sync Service Commands:
