@@ -219,7 +219,10 @@ class UserTableSyncService {
       updatedAt: sourceUser.updated_at,
       firstName: sourceUser.first_name,
       lastName: sourceUser.last_name,
-      preferredLanguage: sourceUser.preferred_language || 'sq' // Default to Albanian
+      preferredLanguage: sourceUser.preferred_language || 'sq', // Default to Albanian
+      // Auto-reply settings (synced as separate columns for efficient querying)
+      autoReplyEnabled: sourceUser.auto_reply_enabled || false,
+      autoReplyMessage: sourceUser.auto_reply_message || null
     };
   }
 
@@ -470,9 +473,10 @@ class UserTableSyncService {
                 INSERT INTO users (
                   id, "externalId", name, phone, email, role, "socketId",
                   "isOnline", "lastSeen", avatar, "metaData", "createdAt",
-                  "updatedAt", "firstName", "lastName", "preferredLanguage"
+                  "updatedAt", "firstName", "lastName", "preferredLanguage",
+                  "autoReplyEnabled", "autoReplyMessage"
                 ) VALUES (
-                  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+                  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
                 )
                 ON CONFLICT ("externalId") DO UPDATE SET
                   name = EXCLUDED.name,
@@ -484,7 +488,9 @@ class UserTableSyncService {
                   "updatedAt" = EXCLUDED."updatedAt",
                   "firstName" = EXCLUDED."firstName",
                   "lastName" = EXCLUDED."lastName",
-                  "preferredLanguage" = EXCLUDED."preferredLanguage"
+                  "preferredLanguage" = EXCLUDED."preferredLanguage",
+                  "autoReplyEnabled" = EXCLUDED."autoReplyEnabled",
+                  "autoReplyMessage" = EXCLUDED."autoReplyMessage"
               `, [
                 transformedUser.id,
                 transformedUser.externalId,
@@ -501,7 +507,9 @@ class UserTableSyncService {
                 transformedUser.updatedAt,
                 transformedUser.firstName,
                 transformedUser.lastName,
-                transformedUser.preferredLanguage
+                transformedUser.preferredLanguage,
+                transformedUser.autoReplyEnabled,
+                transformedUser.autoReplyMessage
               ]);
             }, `sync user ${user.id}`);
 
@@ -549,9 +557,10 @@ class UserTableSyncService {
           INSERT INTO users (
             id, "externalId", name, phone, email, role, "socketId",
             "isOnline", "lastSeen", avatar, "metaData", "createdAt",
-            "updatedAt", "firstName", "lastName", "preferredLanguage"
+            "updatedAt", "firstName", "lastName", "preferredLanguage",
+            "autoReplyEnabled", "autoReplyMessage"
           ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
           )
           ON CONFLICT ("externalId") DO UPDATE SET
             name = EXCLUDED.name,
@@ -563,7 +572,9 @@ class UserTableSyncService {
             "updatedAt" = EXCLUDED."updatedAt",
             "firstName" = EXCLUDED."firstName",
             "lastName" = EXCLUDED."lastName",
-            "preferredLanguage" = EXCLUDED."preferredLanguage"
+            "preferredLanguage" = EXCLUDED."preferredLanguage",
+            "autoReplyEnabled" = EXCLUDED."autoReplyEnabled",
+            "autoReplyMessage" = EXCLUDED."autoReplyMessage"
           RETURNING id;
         `;
 
@@ -583,7 +594,9 @@ class UserTableSyncService {
           transformedUser.updatedAt,
           transformedUser.firstName,
           transformedUser.lastName,
-          transformedUser.preferredLanguage
+          transformedUser.preferredLanguage,
+          transformedUser.autoReplyEnabled,
+          transformedUser.autoReplyMessage
         ];
 
         const result = await this.chatPool.query(query, values);
@@ -657,9 +670,10 @@ class UserTableSyncService {
               INSERT INTO users (
                 id, "externalId", name, phone, email, role, "socketId",
                 "isOnline", "lastSeen", avatar, "metaData", "createdAt",
-                "updatedAt", "firstName", "lastName", "preferredLanguage"
+                "updatedAt", "firstName", "lastName", "preferredLanguage",
+                "autoReplyEnabled", "autoReplyMessage"
               ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
               )
               ON CONFLICT ("externalId") DO UPDATE SET
                 name = EXCLUDED.name,
@@ -671,7 +685,9 @@ class UserTableSyncService {
                 "updatedAt" = EXCLUDED."updatedAt",
                 "firstName" = EXCLUDED."firstName",
                 "lastName" = EXCLUDED."lastName",
-                "preferredLanguage" = EXCLUDED."preferredLanguage"
+                "preferredLanguage" = EXCLUDED."preferredLanguage",
+                "autoReplyEnabled" = EXCLUDED."autoReplyEnabled",
+                "autoReplyMessage" = EXCLUDED."autoReplyMessage"
             `, [
               transformedUser.id,
               transformedUser.externalId,
@@ -688,7 +704,9 @@ class UserTableSyncService {
               transformedUser.updatedAt,
               transformedUser.firstName,
               transformedUser.lastName,
-              transformedUser.preferredLanguage
+              transformedUser.preferredLanguage,
+              transformedUser.autoReplyEnabled,
+              transformedUser.autoReplyMessage
             ]);
           }, `bulk sync user ${user.id}`);
 
