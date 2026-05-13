@@ -427,10 +427,10 @@ class UserTableSyncService {
 
     try {
       this.log('INFO', 'Getting total user count...');
-      const countResult = await this.sourcePool.query("SELECT COUNT(*) as count FROM users WHERE status = 'active'");
+      const countResult = await this.sourcePool.query("SELECT COUNT(*) as count FROM users WHERE status IN ('active', 'pending_completion', 'pending_verification')");
       const totalUsers = parseInt(countResult.rows[0].count);
 
-      this.log('INFO', `Found ${totalUsers.toLocaleString()} active users to sync`);
+      this.log('INFO', `Found ${totalUsers.toLocaleString()} users to sync (active + pending)`);
 
       const limit = 1000;
       let offset = 0;
@@ -453,7 +453,7 @@ class UserTableSyncService {
             created_at, updated_at, bio,
             auto_reply_enabled, auto_reply_message, preferred_language
           FROM users
-          WHERE status = 'active' AND id IS NOT NULL
+          WHERE status IN ('active', 'pending_completion', 'pending_verification') AND id IS NOT NULL
           ORDER BY id
           LIMIT $1 OFFSET $2
         `;
@@ -621,7 +621,7 @@ class UserTableSyncService {
   async bulkSyncUsers(limit = 1000, offset = 0, sinceDate = null) {
     try {
       // Build query with optional date filter - only sync active users with valid data
-      let whereClause = "WHERE status = 'active' AND id IS NOT NULL";
+      let whereClause = "WHERE status IN ('active', 'pending_completion', 'pending_verification') AND id IS NOT NULL";
       const queryParams = [limit, offset];
 
       if (sinceDate) {
@@ -1087,7 +1087,7 @@ class UserTableSyncService {
   async verifySyncStatus() {
     try {
       const [sourceCount, chatCount] = await Promise.all([
-        this.sourcePool.query("SELECT COUNT(*) as count FROM users WHERE status = 'active'"),
+        this.sourcePool.query("SELECT COUNT(*) as count FROM users WHERE status IN ('active', 'pending_completion', 'pending_verification')"),
         this.chatPool.query('SELECT COUNT(*) as count FROM users')
       ]);
 
@@ -1101,7 +1101,7 @@ class UserTableSyncService {
         this.sourcePool.query(`
           SELECT COUNT(*) as count
           FROM users
-          WHERE status = 'active' AND updated_at > NOW() - INTERVAL '1 hour'
+          WHERE status IN ('active', 'pending_completion', 'pending_verification') AND updated_at > NOW() - INTERVAL '1 hour'
         `),
         this.chatPool.query(`
           SELECT COUNT(*) as count
