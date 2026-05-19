@@ -219,7 +219,7 @@ class UserTableSyncService {
       updatedAt: sourceUser.updated_at,
       firstName: sourceUser.first_name,
       lastName: sourceUser.last_name,
-      preferredLanguage: sourceUser.preferred_language || 'sq', // Default to Albanian
+      preferredLanguage: sourceUser.preferred_language || 'en', // Default to English
       // Auto-reply settings (synced as separate columns for efficient querying)
       autoReplyEnabled: sourceUser.auto_reply_enabled || false,
       autoReplyMessage: sourceUser.auto_reply_message || null
