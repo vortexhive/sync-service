@@ -219,7 +219,7 @@ class UserTableSyncService {
       updatedAt: sourceUser.updated_at,
       firstName: sourceUser.first_name,
       lastName: sourceUser.last_name,
-      preferredLanguage: sourceUser.preferred_language || 'en', // Default to English
+      preferredLanguage: this.normalizeLanguage(sourceUser.preferred_language), // Normalize 'al' to 'sq'
       // Auto-reply settings (synced as separate columns for efficient querying)
       autoReplyEnabled: sourceUser.auto_reply_enabled || false,
       autoReplyMessage: sourceUser.auto_reply_message || null
@@ -262,6 +262,20 @@ class UserTableSyncService {
     }
     
     return cleaned;
+  }
+
+  // Normalize language code - maps 'al' to 'sq' (both represent Albanian)
+  // Mobile app sends 'al', but notification system uses 'sq'
+  normalizeLanguage(lang) {
+    if (!lang || typeof lang !== 'string') {
+      return 'en'; // Default to English
+    }
+    const lower = lang.trim().toLowerCase();
+    if (!lower) {
+      return 'en';
+    }
+    // Map 'al' to 'sq' for Albanian
+    return lower === 'al' ? 'sq' : lower;
   }
 
   // Map source roles to chat roles
