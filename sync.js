@@ -63,7 +63,12 @@ class UserTableSyncService {
       backoffMultiplier: parseFloat(process.env.RETRY_BACKOFF_MULTIPLIER) || 2
     };
 
-    this.syncIntervalMinutes = parseInt(process.env.SYNC_INTERVAL_MINUTES) || 1;
+    // Support both SYNC_INTERVAL_SECONDS (preferred) and SYNC_INTERVAL_MINUTES (legacy)
+    // SYNC_INTERVAL_SECONDS takes precedence for near real-time sync
+    const intervalSeconds = parseInt(process.env.SYNC_INTERVAL_SECONDS);
+    const intervalMinutes = parseInt(process.env.SYNC_INTERVAL_MINUTES) || 1;
+    this.syncIntervalSeconds = intervalSeconds || (intervalMinutes * 60);
+    this.syncIntervalMinutes = this.syncIntervalSeconds / 60; // Keep for backward compat
     this.syncWindowMultiplier = parseInt(process.env.SYNC_WINDOW_MULTIPLIER) || 3; // Look back 3x interval
 
     // Validate required environment variables
@@ -85,6 +90,150 @@ class UserTableSyncService {
     });
   }
 
+  // Connection pool health check with auto-recovery
+  async checkPoolHealth() {
+    const healthCheckTimeout = 5000; // 5 second timeout for health checks
+    const results = {
+      source: { healthy: false, latency: null, error: null },
+      chat: { healthy: false, latency: null, error: null }
+    };
+
+    // Check source pool
+    try {
+      const startSource = Date.now();
+      const sourceClient = await Promise.race([
+        this.sourcePool.connect(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), healthCheckTimeout))
+      ]);
+      await sourceClient.query('SELECT 1');
+      sourceClient.release();
+      results.source.healthy = true;
+      results.source.latency = Date.now() - startSource;
+    } catch (err) {
+      results.source.error = err.message;
+      this.log('ERROR', `Source pool health check failed: ${err.message}`);
+    }
+
+    // Check chat pool
+    try {
+      const startChat = Date.now();
+      const chatClient = await Promise.race([
+        this.chatPool.connect(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), healthCheckTimeout))
+      ]);
+      await chatClient.query('SELECT 1');
+      chatClient.release();
+      results.chat.healthy = true;
+      results.chat.latency = Date.now() - startChat;
+    } catch (err) {
+      results.chat.error = err.message;
+      this.log('ERROR', `Chat pool health check failed: ${err.message}`);
+    }
+
+    return results;
+  }
+
+  // Reset connection pools (recreate them)
+  async resetPools() {
+    this.log('WARNING', 'Resetting database connection pools...');
+
+    try {
+      // End existing pools gracefully
+      await Promise.allSettled([
+        this.sourcePool.end(),
+        this.chatPool.end()
+      ]);
+
+      // Wait a moment for connections to close
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Recreate pools
+      this.sourcePool = new Pool(this.sourceDbConfig);
+      this.chatPool = new Pool(this.chatDbConfig);
+
+      // Re-setup error handlers
+      this.setupPoolErrorHandlers();
+
+      // Reset consecutive failures
+      this.syncStats.consecutiveFailures = 0;
+
+      this.log('SUCCESS', 'Connection pools reset successfully');
+      return true;
+    } catch (err) {
+      this.log('ERROR', `Failed to reset pools: ${err.message}`);
+      return false;
+    }
+  }
+
+  // Auto-recovery: check health and reset if needed
+  async autoRecover() {
+    const maxConsecutiveFailures = parseInt(process.env.MAX_CONSECUTIVE_FAILURES) || 10;
+
+    if (this.syncStats.consecutiveFailures >= maxConsecutiveFailures) {
+      this.log('WARNING', `Consecutive failures (${this.syncStats.consecutiveFailures}) exceeded threshold (${maxConsecutiveFailures}). Attempting auto-recovery...`);
+
+      const health = await this.checkPoolHealth();
+
+      if (!health.source.healthy || !health.chat.healthy) {
+        this.log('WARNING', 'Pool health check failed, resetting pools...');
+        await this.resetPools();
+
+        // Re-check health after reset
+        const healthAfterReset = await this.checkPoolHealth();
+        if (healthAfterReset.source.healthy && healthAfterReset.chat.healthy) {
+          this.log('SUCCESS', 'Auto-recovery successful - pools are healthy');
+          return true;
+        } else {
+          this.log('ERROR', 'Auto-recovery failed - pools still unhealthy');
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Start periodic pool health check
+  startPoolHealthCheck() {
+    const healthCheckIntervalMs = parseInt(process.env.POOL_HEALTH_CHECK_INTERVAL) || 60000; // Default: 1 minute
+
+    this.poolHealthCheckInterval = setInterval(async () => {
+      const health = await this.checkPoolHealth();
+
+      // Log pool stats
+      const sourceStats = this.sourcePool.totalCount !== undefined ? {
+        total: this.sourcePool.totalCount,
+        idle: this.sourcePool.idleCount,
+        waiting: this.sourcePool.waitingCount
+      } : 'N/A';
+
+      const chatStats = this.chatPool.totalCount !== undefined ? {
+        total: this.chatPool.totalCount,
+        idle: this.chatPool.idleCount,
+        waiting: this.chatPool.waitingCount
+      } : 'N/A';
+
+      if (!health.source.healthy || !health.chat.healthy) {
+        this.log('WARNING', `Pool health check: Source=${health.source.healthy ? 'OK' : 'FAIL'}, Chat=${health.chat.healthy ? 'OK' : 'FAIL'}`);
+        await this.autoRecover();
+      } else {
+        // Only log detailed stats every 5 minutes to reduce noise
+        if (Date.now() % 300000 < healthCheckIntervalMs) {
+          this.log('INFO', `Pool health: Source(${health.source.latency}ms), Chat(${health.chat.latency}ms)`);
+        }
+      }
+    }, healthCheckIntervalMs);
+
+    this.log('INFO', `Pool health check started (interval: ${healthCheckIntervalMs / 1000}s)`);
+  }
+
+  stopPoolHealthCheck() {
+    if (this.poolHealthCheckInterval) {
+      clearInterval(this.poolHealthCheckInterval);
+      this.poolHealthCheckInterval = null;
+      this.log('INFO', 'Pool health check stopped');
+    }
+  }
+
   validateConfig() {
     const requiredVars = [
       'SOURCE_DB_PASSWORD',
@@ -104,8 +253,14 @@ class UserTableSyncService {
     console.log('🔧 Database Configuration:');
     console.log(`   Source: ${this.sourceDbConfig.user}@${this.sourceDbConfig.host}:${this.sourceDbConfig.port}/${this.sourceDbConfig.database} (Pool: ${this.sourceDbConfig.max})`);
     console.log(`   Chat: ${this.chatDbConfig.user}@${this.chatDbConfig.host}:${this.chatDbConfig.port}/${this.chatDbConfig.database} (Pool: ${this.chatDbConfig.max})`);
-    console.log(`   Sync Interval: ${this.syncIntervalMinutes} minute(s)`);
-    console.log(`   Sync Window: ${this.syncIntervalMinutes * this.syncWindowMultiplier} minute(s) lookback`);
+    const intervalDisplay = this.syncIntervalSeconds < 60
+      ? `${this.syncIntervalSeconds} second(s)`
+      : `${this.syncIntervalMinutes} minute(s)`;
+    const windowDisplay = this.syncIntervalSeconds * this.syncWindowMultiplier < 60
+      ? `${this.syncIntervalSeconds * this.syncWindowMultiplier} second(s)`
+      : `${this.syncIntervalMinutes * this.syncWindowMultiplier} minute(s)`;
+    console.log(`   Sync Interval: ${intervalDisplay}`);
+    console.log(`   Sync Window: ${windowDisplay} lookback`);
   }
 
   // Structured logging helper
@@ -915,10 +1070,12 @@ class UserTableSyncService {
         this.syncStats.scheduledSyncActive = true;
 
         // Look back 3x the interval to ensure overlap and catch any missed updates
-        const lookbackMinutes = intervalMinutes * this.syncWindowMultiplier;
-        const since = new Date(Date.now() - lookbackMinutes * 60 * 1000);
+        // Uses seconds-based calculation for near real-time sync support
+        const lookbackSeconds = this.syncIntervalSeconds * this.syncWindowMultiplier;
+        const since = new Date(Date.now() - lookbackSeconds * 1000);
+        const lookbackDisplay = lookbackSeconds < 60 ? `${lookbackSeconds}s` : `${Math.round(lookbackSeconds / 60)}m`;
 
-        this.log('INFO', `Running scheduled sync (looking back ${lookbackMinutes} minutes to ${since.toISOString()})...`);
+        this.log('INFO', `Running scheduled sync (looking back ${lookbackDisplay} to ${since.toISOString()})...`);
 
         let hasMore = true;
         let offset = 0;
@@ -941,9 +1098,10 @@ class UserTableSyncService {
 
         this.log('SUCCESS', `Scheduled sync completed in ${Math.round(duration / 1000)}s (${totalSyncedThisCycle} users processed)`);
 
-        // Check if sync is taking too long
-        if (duration > intervalMinutes * 60 * 1000 * 0.8) {
-          this.log('WARNING', `Sync duration (${Math.round(duration / 1000)}s) is close to interval (${intervalMinutes * 60}s). Consider increasing interval or optimizing sync process.`);
+        // Check if sync is taking too long (>80% of interval)
+        const intervalMs = this.syncIntervalSeconds * 1000;
+        if (duration > intervalMs * 0.8) {
+          this.log('WARNING', `Sync duration (${Math.round(duration / 1000)}s) is close to interval (${this.syncIntervalSeconds}s). Consider increasing interval or optimizing sync process.`);
         }
 
       } catch (error) {
@@ -957,21 +1115,29 @@ class UserTableSyncService {
       }
     };
 
-    this.log('SUCCESS', `Scheduled sync started (every ${intervalMinutes} minute(s), looking back ${intervalMinutes * this.syncWindowMultiplier} minutes)`);
+    const intervalDisplay = this.syncIntervalSeconds < 60 ? `${this.syncIntervalSeconds}s` : `${intervalMinutes}m`;
+    const windowDisplay = this.syncIntervalSeconds * this.syncWindowMultiplier < 60
+      ? `${this.syncIntervalSeconds * this.syncWindowMultiplier}s`
+      : `${Math.round(this.syncIntervalSeconds * this.syncWindowMultiplier / 60)}m`;
+    this.log('SUCCESS', `Scheduled sync started (every ${intervalDisplay}, looking back ${windowDisplay})`);
 
     // Start first sync after the interval
     this.scheduledSyncTimeout = setTimeout(runScheduledSync, intervalMinutes * 60 * 1000);
   }
 
   // Helper to schedule the next sync iteration
+  // Uses syncIntervalSeconds for near real-time sync support
   scheduleNextSync(intervalMinutes) {
     if (this.scheduledSyncTimeout) {
       clearTimeout(this.scheduledSyncTimeout);
     }
 
+    // Use seconds-based interval (more precise for short intervals)
+    const intervalMs = this.syncIntervalSeconds * 1000;
+
     this.scheduledSyncTimeout = setTimeout(async () => {
       await this.runScheduledSyncCycle(intervalMinutes);
-    }, intervalMinutes * 60 * 1000);
+    }, intervalMs);
   }
 
   // Run a single scheduled sync cycle
@@ -990,10 +1156,12 @@ class UserTableSyncService {
       this.syncStats.scheduledSyncActive = true;
 
       // Look back 3x the interval to ensure overlap and catch any missed updates
-      const lookbackMinutes = intervalMinutes * this.syncWindowMultiplier;
-      const since = new Date(Date.now() - lookbackMinutes * 60 * 1000);
+      // Uses seconds-based calculation for near real-time sync support
+      const lookbackSeconds = this.syncIntervalSeconds * this.syncWindowMultiplier;
+      const since = new Date(Date.now() - lookbackSeconds * 1000);
 
-      this.log('INFO', `Running scheduled sync (looking back ${lookbackMinutes} minutes to ${since.toISOString()})...`);
+      const lookbackDisplay = lookbackSeconds < 60 ? `${lookbackSeconds}s` : `${Math.round(lookbackSeconds / 60)}m`;
+      this.log('INFO', `Running scheduled sync (looking back ${lookbackDisplay} to ${since.toISOString()})...`);
 
       let hasMore = true;
       let offset = 0;
@@ -1018,6 +1186,9 @@ class UserTableSyncService {
 
     } catch (error) {
       await this.logError('SCHEDULED_SYNC_FAILED', null, error);
+
+      // Attempt auto-recovery if we have too many consecutive failures
+      await this.autoRecover();
     } finally {
       this.isSyncInProgress = false;
       this.syncStats.scheduledSyncActive = false;
@@ -1086,7 +1257,7 @@ class UserTableSyncService {
       recommendations.push(`No successful sync in ${Math.round(timeSinceLastSync / 60)} minutes - check service health`);
     }
 
-    if (this.syncStats.lastSyncDuration && this.syncStats.lastSyncDuration > this.syncIntervalMinutes * 60 * 1000 * 0.8) {
+    if (this.syncStats.lastSyncDuration && this.syncStats.lastSyncDuration > this.syncIntervalSeconds * 1000 * 0.8) {
       recommendations.push('Sync duration approaching interval time - consider increasing interval or optimizing queries');
     }
 
@@ -1282,10 +1453,14 @@ sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
 
       this.log('SUCCESS', 'User Table Sync Service is running!');
       this.log('INFO', `  Real-time sync: ${this.isListening ? 'Active' : 'Inactive'}`);
-      this.log('INFO', `  Scheduled sync: Every ${this.syncIntervalMinutes} minute(s)`);
+      const intervalDisplay = this.syncIntervalSeconds < 60 ? `${this.syncIntervalSeconds}s` : `${this.syncIntervalMinutes}m`;
+      this.log('INFO', `  Scheduled sync: Every ${intervalDisplay}`);
 
       // 5. Start HTTP server for health checks
       this.startHttpServer();
+
+      // 6. Start pool health check with auto-recovery
+      this.startPoolHealthCheck();
 
       // Setup graceful shutdown handler
       this.setupGracefulShutdown();
@@ -1341,7 +1516,10 @@ sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
           }
         }
 
-        // 4. Close HTTP server
+        // 4. Stop pool health check
+        this.stopPoolHealthCheck();
+
+        // 5. Close HTTP server
         if (this.httpServer) {
           await new Promise((resolve) => {
             this.httpServer.close(() => {
