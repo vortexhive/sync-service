@@ -1,5 +1,7 @@
 // userTableSync.js - Complete sync service for source -> chat database
+// v2.0: Added cache reconciliation mode (June 2026)
 const { Pool } = require('pg');
+const Redis = require('ioredis');
 const http = require('http');
 require('dotenv').config();
 
@@ -32,6 +34,52 @@ class UserTableSyncService {
     // Initialize connection pools
     this.sourcePool = new Pool(this.sourceDbConfig);
     this.chatPool = new Pool(this.chatDbConfig);
+
+    // Redis configuration for cache reconciliation mode
+    this.redisConfig = {
+      host: process.env.REDIS_HOST || 'localhost',
+      port: parseInt(process.env.REDIS_PORT) || 6379,
+      password: process.env.REDIS_PASSWORD || undefined,
+      db: parseInt(process.env.REDIS_DB) || 0,
+      retryDelayOnFailover: 100,
+      maxRetriesPerRequest: 3
+    };
+    this.redis = null; // Lazy init
+    this.userCachePrefix = 'user:';
+    this.cacheMissCount = new Map(); // Track consecutive misses per user
+    this.staleMissThreshold = parseInt(process.env.STALE_MISS_THRESHOLD) || 4;
+    this.cacheMode = process.env.SYNC_MODE === 'cache'; // Enable with SYNC_MODE=cache
+    // If true, users not in cache are immediately marked inactive (deleted from backend)
+    // If false, wait for staleMissThreshold consecutive misses
+    this.immediateInactive = process.env.IMMEDIATE_INACTIVE === 'true';
+
+    // Circuit breaker for Redis failures - prevents mass deactivation on Redis outage
+    this.redisCircuitBreaker = {
+      failures: 0,
+      maxFailures: parseInt(process.env.REDIS_MAX_FAILURES) || 3,
+      isOpen: false,
+      lastFailure: null,
+      resetAfterMs: parseInt(process.env.REDIS_CIRCUIT_RESET_MS) || 60000 // 1 minute
+    };
+
+    // Enhanced telemetry for cache reconciliation
+    this.telemetry = {
+      totalReconciliations: 0,
+      avgReconcileTimeMs: 0,
+      avgCacheFetchTimeMs: 0,
+      avgDbUpdateTimeMs: 0,
+      lastReconciliation: null,
+      reconciliationHistory: [], // Last 100 detailed reports
+      operations: {
+        fetchChatUsers: { count: 0, totalMs: 0, avgMs: 0, minMs: Infinity, maxMs: 0 },
+        fetchCachedUser: { count: 0, totalMs: 0, avgMs: 0, minMs: Infinity, maxMs: 0 },
+        compareChanges: { count: 0, totalMs: 0, avgMs: 0, minMs: Infinity, maxMs: 0 },
+        updateUser: { count: 0, totalMs: 0, avgMs: 0, minMs: Infinity, maxMs: 0 },
+        markInactive: { count: 0, totalMs: 0, avgMs: 0, minMs: Infinity, maxMs: 0 },
+        deactivateDuplicate: { count: 0, totalMs: 0, avgMs: 0, minMs: Infinity, maxMs: 0 },
+        closeUserSessions: { count: 0, totalMs: 0, avgMs: 0, minMs: Infinity, maxMs: 0 }
+      }
+    };
 
     // Real-time sync client (separate from pool)
     this.realtimeClient = null;
@@ -1386,12 +1434,41 @@ sync_scheduled_active ${stats.scheduledSyncActive ? 1 : 0}
 sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
 `);
 
+      } else if (req.url === '/telemetry') {
+        // Detailed telemetry endpoint for cache reconciliation
+        const telemetry = this.getTelemetrySummary();
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          service: 'user-sync-service',
+          mode: this.cacheMode ? 'cache' : 'legacy',
+          timestamp: new Date().toISOString(),
+          telemetry: telemetry
+        }, null, 2));
+
+      } else if (req.url === '/telemetry/history') {
+        // Full reconciliation history
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          service: 'user-sync-service',
+          timestamp: new Date().toISOString(),
+          history: this.telemetry.reconciliationHistory
+        }, null, 2));
+
+      } else if (req.url === '/telemetry/operations') {
+        // Operation-level timing stats
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          service: 'user-sync-service',
+          timestamp: new Date().toISOString(),
+          operations: this.telemetry.operations
+        }, null, 2));
+
       } else {
         // 404 for unknown endpoints
         res.writeHead(404);
         res.end(JSON.stringify({
           error: 'Not Found',
-          endpoints: ['/health', '/status', '/metrics']
+          endpoints: ['/health', '/status', '/metrics', '/telemetry', '/telemetry/history', '/telemetry/operations']
         }, null, 2));
       }
     });
@@ -1401,6 +1478,7 @@ sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
       this.log('INFO', `  Health check: http://localhost:${port}/health`);
       this.log('INFO', `  Status: http://localhost:${port}/status`);
       this.log('INFO', `  Metrics: http://localhost:${port}/metrics`);
+      this.log('INFO', `  Telemetry: http://localhost:${port}/telemetry`);
     });
 
     this.httpServer.on('error', (err) => {
@@ -1408,9 +1486,810 @@ sync_last_duration_seconds ${stats.lastSyncDurationSeconds || 0}
     });
   }
 
+  // =============================================
+  // TELEMETRY HELPERS
+  // =============================================
+
+  /**
+   * Track operation timing with detailed telemetry
+   */
+  trackOperation(operationName, durationMs, metadata = {}) {
+    const op = this.telemetry.operations[operationName];
+    if (op) {
+      op.count++;
+      op.totalMs += durationMs;
+      op.avgMs = Math.round(op.totalMs / op.count * 100) / 100;
+      op.minMs = Math.min(op.minMs, durationMs);
+      op.maxMs = Math.max(op.maxMs, durationMs);
+    }
+
+    // Log with timestamp
+    const timestamp = new Date().toISOString();
+    const metaStr = Object.keys(metadata).length > 0 ? ` | ${JSON.stringify(metadata)}` : '';
+    this.log('DEBUG', `📊 [${operationName}] ${durationMs}ms${metaStr}`);
+  }
+
+  /**
+   * Time an async operation and track telemetry
+   */
+  async timeOperation(operationName, asyncFn, metadata = {}) {
+    const start = Date.now();
+    try {
+      const result = await asyncFn();
+      const duration = Date.now() - start;
+      this.trackOperation(operationName, duration, { ...metadata, success: true });
+      return result;
+    } catch (error) {
+      const duration = Date.now() - start;
+      this.trackOperation(operationName, duration, { ...metadata, success: false, error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+   * Get telemetry summary for logging/API
+   */
+  getTelemetrySummary() {
+    const ops = this.telemetry.operations;
+    return {
+      totalReconciliations: this.telemetry.totalReconciliations,
+      lastReconciliation: this.telemetry.lastReconciliation,
+      avgReconcileTimeMs: this.telemetry.avgReconcileTimeMs,
+      operations: Object.entries(ops).reduce((acc, [name, stats]) => {
+        if (stats.count > 0) {
+          acc[name] = {
+            count: stats.count,
+            avgMs: stats.avgMs,
+            minMs: stats.minMs === Infinity ? 0 : stats.minMs,
+            maxMs: stats.maxMs
+          };
+        }
+        return acc;
+      }, {}),
+      recentHistory: this.telemetry.reconciliationHistory.slice(-10)
+    };
+  }
+
+  /**
+   * Log detailed reconciliation report
+   */
+  logReconciliationReport(report) {
+    const {
+      totalUsers, cacheHits, cacheMisses, redisErrors = 0, updated, markedInactive,
+      duplicatesDeactivated, sessionsClosed, durationMs, breakdown,
+      circuitBreaker = { failures: 0, isOpen: false }, cacheMissCountSize = 0,
+      reactivated = 0
+    } = report;
+
+    // Determine circuit breaker status display
+    const cbStatus = circuitBreaker.isOpen
+      ? `🔴 OPEN (${circuitBreaker.failures} failures - reconciliation PAUSED)`
+      : `🟢 closed (${circuitBreaker.failures} failures)`;
+
+    console.log('\n' + '='.repeat(80));
+    console.log(`📊 CACHE RECONCILIATION REPORT - ${new Date().toISOString()}`);
+    console.log('='.repeat(80));
+    console.log(`
+  📈 SUMMARY
+  ─────────────────────────────────────────────────
+  Total Users Processed : ${totalUsers}
+  Cache Hits            : ${cacheHits} (${totalUsers > 0 ? Math.round(cacheHits/totalUsers*100) : 0}%)
+  Cache Misses          : ${cacheMisses} (${totalUsers > 0 ? Math.round(cacheMisses/totalUsers*100) : 0}%)
+  Redis Errors          : ${redisErrors}${redisErrors > 0 ? ' ⚠️' : ''}
+  Users Updated         : ${updated}
+  Users Reactivated     : ${reactivated}${reactivated > 0 ? ' ♻️' : ''}
+  Marked Inactive       : ${markedInactive}
+  Duplicates Deactivated: ${duplicatesDeactivated}
+  Sessions Closed       : ${sessionsClosed}
+  Total Duration        : ${durationMs}ms
+
+  🔌 REDIS HEALTH
+  ─────────────────────────────────────────────────
+  Circuit Breaker       : ${cbStatus}
+  Pending Miss Counts   : ${cacheMissCountSize} users being tracked
+
+  ⏱️  TIMING BREAKDOWN
+  ─────────────────────────────────────────────────
+  Fetch Chat Users      : ${breakdown.fetchChatUsersMs}ms
+  Fetch Cached Users    : ${breakdown.fetchCachedUsersMs}ms (total)
+  Compare Changes       : ${breakdown.compareChangesMs}ms (total)
+  Update Users          : ${breakdown.updateUsersMs}ms (total)
+  Mark Inactive         : ${breakdown.markInactiveMs}ms (total)
+  Deactivate Duplicates : ${breakdown.deactivateDuplicatesMs}ms (total)
+  Close Sessions        : ${breakdown.closeSessionsMs}ms (total)
+    `);
+    console.log('='.repeat(80) + '\n');
+
+    // Store in history (keep last 100)
+    this.telemetry.reconciliationHistory.push({
+      timestamp: new Date().toISOString(),
+      ...report
+    });
+    if (this.telemetry.reconciliationHistory.length > 100) {
+      this.telemetry.reconciliationHistory.shift();
+    }
+
+    this.telemetry.lastReconciliation = report;
+    this.telemetry.totalReconciliations++;
+    this.telemetry.avgReconcileTimeMs = Math.round(
+      this.telemetry.reconciliationHistory.reduce((sum, r) => sum + r.durationMs, 0) /
+      this.telemetry.reconciliationHistory.length
+    );
+  }
+
+  // =============================================
+  // CACHE RECONCILIATION MODE (June 2026)
+  // Monitors Redis cache and reconciles chat DB
+  // =============================================
+
+  /**
+   * Initialize Redis connection with Azure TLS support
+   */
+  async initRedis() {
+    if (this.redis) return;
+
+    const useTLS = process.env.REDIS_TLS === 'true';
+    const redisHost = process.env.REDIS_HOST || 'localhost';
+
+    const redisOptions = {
+      host: redisHost,
+      port: parseInt(process.env.REDIS_PORT) || (useTLS ? 6380 : 6379),
+      password: process.env.REDIS_PASSWORD || undefined,
+      db: parseInt(process.env.REDIS_DB) || 0,
+      retryDelayOnFailover: 100,
+      maxRetriesPerRequest: 3,
+      // Azure Redis requires TLS with servername
+      ...(useTLS && {
+        tls: {
+          servername: redisHost,
+          rejectUnauthorized: false
+        }
+      })
+    };
+
+    this.redis = new Redis(redisOptions);
+
+    this.redis.on('error', (err) => {
+      this.log('ERROR', `Redis error: ${err.message}`);
+      this.syncStats.errors++;
+    });
+
+    this.redis.on('connect', () => {
+      this.log('SUCCESS', `Redis connected (TLS: ${useTLS ? 'yes' : 'no'})`);
+    });
+
+    // Wait for connection
+    await new Promise((resolve, reject) => {
+      this.redis.once('ready', resolve);
+      this.redis.once('error', reject);
+      setTimeout(() => reject(new Error('Redis connection timeout')), 10000);
+    });
+  }
+
+  /**
+   * Check if Redis is connected and healthy
+   */
+  isRedisHealthy() {
+    return this.redis && this.redis.status === 'ready';
+  }
+
+  /**
+   * Get user from Redis cache
+   * Returns null if cache miss, throws if Redis is unavailable
+   */
+  async getCachedUser(userId) {
+    // CRITICAL: Check Redis health first to prevent false cache misses
+    if (!this.isRedisHealthy()) {
+      const error = new Error('Redis connection not ready');
+      this.log('ERROR', `[${new Date().toISOString()}] ❌ Redis unavailable, cannot check cache for ${userId.substring(0, 8)}...`);
+      throw error; // Throw instead of returning null to distinguish from real cache miss
+    }
+
+    try {
+      const cacheKey = `${this.userCachePrefix}${userId}`;
+      const data = await this.redis.get(cacheKey);
+      if (data) {
+        try {
+          return JSON.parse(data);
+        } catch (parseError) {
+          // Corrupted cache data - log and delete
+          this.log('ERROR', `[${new Date().toISOString()}] ⚠️ Corrupted cache data for ${userId.substring(0, 8)}..., deleting key`);
+          await this.redis.del(cacheKey);
+          return null;
+        }
+      }
+      return null;
+    } catch (error) {
+      this.log('ERROR', `[${new Date().toISOString()}] ❌ Failed to get cached user ${userId.substring(0, 8)}...: ${error.message}`);
+      throw error; // Re-throw to signal Redis failure
+    }
+  }
+
+  /**
+   * Get all ACTIVE users from chat DB for reconciliation
+   * Excludes users already marked as inactive to improve performance
+   */
+  async getChatDbUsers() {
+    const result = await this.chatPool.query(`
+      SELECT
+        id, "externalId", name, "firstName", "lastName", email, phone,
+        avatar, role, "metaData", "preferredLanguage",
+        "autoReplyEnabled", "autoReplyMessage", "updatedAt"
+      FROM users
+      WHERE "externalId" IS NOT NULL
+        AND COALESCE(("metaData"->>'isActive')::boolean, true) = true
+      ORDER BY "updatedAt" DESC
+    `);
+    return result.rows;
+  }
+
+  /**
+   * Check if cached data differs from chat DB data
+   */
+  /**
+   * Check if cached user data differs from chat DB data
+   * Also detects re-activation: user marked inactive in chat DB but active in cache
+   * @returns {Object} { hasChanges: boolean, isReactivation: boolean }
+   */
+  hasChanges(chatUser, cachedUser) {
+    // Check for re-activation: user was marked inactive but cache shows active
+    const chatIsActive = chatUser.metaData?.isActive !== false;
+    const cachedIsActive = cachedUser.status === 'active' || !cachedUser.status; // Default to active if no status
+    const isReactivation = !chatIsActive && cachedIsActive;
+
+    if (isReactivation) {
+      this.log('INFO', `[${new Date().toISOString()}] ♻️ User ${chatUser.externalId?.substring(0, 8)}... RE-ACTIVATION detected (was inactive, now active in cache)`);
+      return { hasChanges: true, isReactivation: true };
+    }
+
+    const chatName = chatUser.name || '';
+    const cachedName = cachedUser.name ||
+      `${cachedUser.firstName || ''} ${cachedUser.lastName || ''}`.trim() || '';
+
+    if (chatName !== cachedName) return { hasChanges: true, isReactivation: false };
+    if (chatUser.firstName !== cachedUser.firstName) return { hasChanges: true, isReactivation: false };
+    if (chatUser.lastName !== cachedUser.lastName) return { hasChanges: true, isReactivation: false };
+    if (chatUser.email !== cachedUser.email) return { hasChanges: true, isReactivation: false };
+    if (chatUser.phone !== cachedUser.phone) return { hasChanges: true, isReactivation: false };
+    if (chatUser.avatar !== cachedUser.avatarUrl) return { hasChanges: true, isReactivation: false };
+    if (chatUser.preferredLanguage !== cachedUser.preferredLanguage) return { hasChanges: true, isReactivation: false };
+    if (chatUser.autoReplyEnabled !== cachedUser.autoReplyEnabled) return { hasChanges: true, isReactivation: false };
+    if (chatUser.autoReplyMessage !== cachedUser.autoReplyMessage) return { hasChanges: true, isReactivation: false };
+
+    return { hasChanges: false, isReactivation: false };
+  }
+
+  /**
+   * Update user in chat DB with cached data
+   */
+  async updateChatDbUserFromCache(externalId, cachedUser) {
+    const name = cachedUser.name ||
+      `${cachedUser.firstName || ''} ${cachedUser.lastName || ''}`.trim() ||
+      'Unknown User';
+
+    await this.chatPool.query(`
+      UPDATE users SET
+        name = $1,
+        "firstName" = $2,
+        "lastName" = $3,
+        email = $4,
+        phone = $5,
+        avatar = $6,
+        role = $7,
+        "preferredLanguage" = $8,
+        "autoReplyEnabled" = $9,
+        "autoReplyMessage" = $10,
+        "metaData" = COALESCE("metaData", '{}'::jsonb) || $11::jsonb,
+        "updatedAt" = NOW()
+      WHERE "externalId" = $12
+    `, [
+      name,
+      cachedUser.firstName || null,
+      cachedUser.lastName || null,
+      cachedUser.email || null,
+      cachedUser.phone || null,
+      cachedUser.avatarUrl || null,
+      cachedUser.role || 'customer',
+      cachedUser.preferredLanguage || 'en',
+      cachedUser.autoReplyEnabled || false,
+      cachedUser.autoReplyMessage || null,
+      JSON.stringify({
+        privacySettings: cachedUser.privacySettings,
+        notificationPreference: cachedUser.notificationPreference,
+        bio: cachedUser.bio,
+        isVerified: cachedUser.isVerified,
+        averageRating: cachedUser.averageRating,
+        totalRatings: cachedUser.totalRatings,
+        lastCacheSync: Date.now(),
+        // Re-activate user when found in cache (clears inactive status)
+        isActive: true,
+        cacheStatus: 'found',
+        reactivatedAt: cachedUser.status === 'active' ? new Date().toISOString() : null
+      }),
+      externalId
+    ]);
+  }
+
+  /**
+   * Mark user as inactive (not in cache for too long)
+   * Also closes any active chat sessions for this user
+   */
+  async markUserInactive(externalId) {
+    const timestamp = new Date().toISOString();
+    this.log('INFO', `[${timestamp}] 🔄 Marking user ${externalId.substring(0, 8)}... as inactive`);
+
+    await this.chatPool.query(`
+      UPDATE users SET
+        "metaData" = COALESCE("metaData", '{}'::jsonb) || $1::jsonb,
+        "isOnline" = false,
+        "socketId" = NULL,
+        "updatedAt" = NOW()
+      WHERE "externalId" = $2
+    `, [
+      JSON.stringify({
+        cacheStatus: 'not_found',
+        markedInactiveAt: timestamp,
+        reason: 'User not found in cache for extended period',
+        isActive: false
+      }),
+      externalId
+    ]);
+    this.log('WARNING', `[${timestamp}] ⚠️ User ${externalId.substring(0, 8)}... marked inactive, sessions closed`);
+  }
+
+  /**
+   * Deactivate duplicate users with same email AND phone AND role
+   * Keeps the one matching externalId active, marks others inactive
+   * Uses AND logic to prevent false positives (both email AND phone must match)
+   */
+  async deactivateDuplicateUsers(externalId, email, phone, role) {
+    const timestamp = new Date().toISOString();
+
+    // Skip if no email/phone to match on
+    if (!email && !phone) {
+      this.log('DEBUG', `[${timestamp}] ⏭️ Skipping duplicate check - no email/phone`);
+      return 0;
+    }
+
+    this.log('DEBUG', `[${timestamp}] 🔍 Checking for duplicates: email=${email || 'null'}, phone=${phone || 'null'}, role=${role}`);
+
+    // Find users with BOTH same email AND phone AND role but different externalId
+    // This is more precise than OR to prevent false positives
+    let duplicatesResult;
+
+    if (email && phone) {
+      // Both email and phone available - strict matching
+      duplicatesResult = await this.chatPool.query(`
+        SELECT id, "externalId", name, email, phone, role
+        FROM users
+        WHERE "externalId" != $1
+          AND email = $2
+          AND phone = $3
+          AND role = $4
+          AND COALESCE(("metaData"->>'isActive')::boolean, true) = true
+      `, [externalId, email, phone, role]);
+    } else if (email) {
+      // Only email available
+      duplicatesResult = await this.chatPool.query(`
+        SELECT id, "externalId", name, email, phone, role
+        FROM users
+        WHERE "externalId" != $1
+          AND email = $2
+          AND role = $3
+          AND COALESCE(("metaData"->>'isActive')::boolean, true) = true
+      `, [externalId, email, role]);
+    } else {
+      // Only phone available
+      duplicatesResult = await this.chatPool.query(`
+        SELECT id, "externalId", name, email, phone, role
+        FROM users
+        WHERE "externalId" != $1
+          AND phone = $2
+          AND role = $3
+          AND COALESCE(("metaData"->>'isActive')::boolean, true) = true
+      `, [externalId, phone, role]);
+    }
+
+    const duplicates = duplicatesResult.rows;
+
+    if (duplicates.length > 0) {
+      this.log('WARNING', `[${timestamp}] 🔄 Found ${duplicates.length} duplicate(s) to deactivate`);
+
+      for (const dup of duplicates) {
+        const dupTimestamp = new Date().toISOString();
+        this.log('INFO', `[${dupTimestamp}] 🚫 Deactivating duplicate: ${dup.externalId?.substring(0, 8) || dup.id}...`);
+
+        // Mark as inactive and close sessions
+        await this.chatPool.query(`
+          UPDATE users SET
+            "metaData" = COALESCE("metaData", '{}'::jsonb) || $1::jsonb,
+            "isOnline" = false,
+            "socketId" = NULL,
+            "updatedAt" = NOW()
+          WHERE id = $2
+        `, [
+          JSON.stringify({
+            isActive: false,
+            deactivatedAt: dupTimestamp,
+            deactivatedReason: 'duplicate_user',
+            replacedByExternalId: externalId
+          }),
+          dup.id
+        ]);
+      }
+    }
+
+    return duplicates.length;
+  }
+
+  /**
+   * Close all chat sessions for a user (conversation participants, typing indicators, etc.)
+   */
+  async closeUserSessions(externalId) {
+    const timestamp = new Date().toISOString();
+    this.log('INFO', `[${timestamp}] 🔒 Closing sessions for user ${externalId.substring(0, 8)}...`);
+
+    try {
+      // Clear socket and online status
+      await this.chatPool.query(`
+        UPDATE users SET
+          "isOnline" = false,
+          "socketId" = NULL,
+          "lastSeen" = NOW()
+        WHERE "externalId" = $1
+      `, [externalId]);
+
+      // Optional: Mark typing indicators as stopped
+      try {
+        await this.chatPool.query(`
+          DELETE FROM typing_indicators
+          WHERE user_id IN (SELECT id FROM users WHERE "externalId" = $1)
+        `, [externalId]);
+      } catch (e) {
+        // Table might not exist
+      }
+
+      this.log('SUCCESS', `[${timestamp}] 🔒 Sessions closed for user ${externalId.substring(0, 8)}...`);
+      return true;
+    } catch (error) {
+      this.log('ERROR', `[${timestamp}] ❌ Failed to close sessions: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Check if circuit breaker should be reset (after cooldown period)
+   */
+  checkCircuitBreakerReset() {
+    if (!this.redisCircuitBreaker.isOpen) return;
+
+    const timeSinceFailure = Date.now() - this.redisCircuitBreaker.lastFailure;
+    if (timeSinceFailure >= this.redisCircuitBreaker.resetAfterMs) {
+      this.log('INFO', `[${new Date().toISOString()}] 🔄 Redis circuit breaker RESET - attempting reconnection`);
+      this.redisCircuitBreaker.isOpen = false;
+      this.redisCircuitBreaker.failures = 0;
+    }
+  }
+
+  /**
+   * Record Redis failure and potentially open circuit breaker
+   */
+  recordRedisFailure() {
+    this.redisCircuitBreaker.failures++;
+    this.redisCircuitBreaker.lastFailure = Date.now();
+
+    if (this.redisCircuitBreaker.failures >= this.redisCircuitBreaker.maxFailures) {
+      this.redisCircuitBreaker.isOpen = true;
+      this.log('ERROR', `[${new Date().toISOString()}] 🔴 Redis circuit breaker OPEN - ${this.redisCircuitBreaker.failures} failures. Will retry after ${this.redisCircuitBreaker.resetAfterMs / 1000}s`);
+    }
+  }
+
+  /**
+   * Clean up cacheMissCount entries for users no longer in chat DB
+   */
+  cleanupCacheMissCount(chatUserIds) {
+    const before = this.cacheMissCount.size;
+    for (const [externalId] of this.cacheMissCount) {
+      if (!chatUserIds.has(externalId)) {
+        this.cacheMissCount.delete(externalId);
+      }
+    }
+    const removed = before - this.cacheMissCount.size;
+    if (removed > 0) {
+      this.log('DEBUG', `[${new Date().toISOString()}] 🧹 Cleaned up ${removed} stale cacheMissCount entries`);
+    }
+  }
+
+  /**
+   * Main cache reconciliation - runs every N seconds with detailed telemetry
+   */
+  async reconcileCache() {
+    if (this.isSyncInProgress) {
+      this.log('WARNING', `[${new Date().toISOString()}] ⏭️ Previous reconciliation still in progress, skipping`);
+      return;
+    }
+
+    // Check if circuit breaker should be reset
+    this.checkCircuitBreakerReset();
+
+    // If circuit breaker is open, skip reconciliation to prevent mass deactivation
+    if (this.redisCircuitBreaker.isOpen) {
+      this.log('WARNING', `[${new Date().toISOString()}] 🔴 Redis circuit breaker OPEN - skipping reconciliation to prevent mass deactivation`);
+      return;
+    }
+
+    const reconcileStart = Date.now();
+    const reconcileTimestamp = new Date().toISOString();
+    this.isSyncInProgress = true;
+
+    // Timing breakdown
+    const timing = {
+      fetchChatUsersMs: 0,
+      fetchCachedUsersMs: 0,
+      compareChangesMs: 0,
+      updateUsersMs: 0,
+      markInactiveMs: 0,
+      deactivateDuplicatesMs: 0,
+      closeSessionsMs: 0
+    };
+
+    // Counters
+    let updated = 0;
+    let reactivated = 0; // Users re-activated (were inactive, now active in cache)
+    let markedInactive = 0;
+    let duplicatesDeactivated = 0;
+    let sessionsClosed = 0;
+    let cacheHits = 0;
+    let cacheMisses = 0;
+    let redisErrors = 0;
+    let chatUsers = [];
+
+    console.log('\n' + '─'.repeat(80));
+    this.log('INFO', `[${reconcileTimestamp}] 🔄 STARTING CACHE RECONCILIATION`);
+    console.log('─'.repeat(80));
+
+    try {
+      // Step 1: Fetch all users from chat DB
+      const fetchChatStart = Date.now();
+      this.log('INFO', `[${new Date().toISOString()}] 📥 Fetching users from chat database...`);
+      chatUsers = await this.getChatDbUsers();
+      timing.fetchChatUsersMs = Date.now() - fetchChatStart;
+      this.trackOperation('fetchChatUsers', timing.fetchChatUsersMs, { count: chatUsers.length });
+      this.log('SUCCESS', `[${new Date().toISOString()}] 📥 Fetched ${chatUsers.length} users in ${timing.fetchChatUsersMs}ms`);
+
+      // Step 2: Process each user
+      for (let i = 0; i < chatUsers.length; i++) {
+        const chatUser = chatUsers[i];
+        const externalId = chatUser.externalId;
+        const userLog = `User ${i + 1}/${chatUsers.length} [${externalId.substring(0, 8)}...]`;
+
+        // 2a: Fetch from cache (with Redis error handling)
+        const fetchCacheStart = Date.now();
+        let cachedUser = null;
+        let redisError = false;
+
+        try {
+          cachedUser = await this.getCachedUser(externalId);
+        } catch (error) {
+          // Redis error - NOT a cache miss, skip this user to avoid false deactivation
+          redisErrors++;
+          this.recordRedisFailure();
+          this.log('ERROR', `[${new Date().toISOString()}] ⚠️ ${userLog}: Redis error, skipping (${error.message})`);
+          redisError = true;
+
+          // If circuit breaker opened, abort entire reconciliation
+          if (this.redisCircuitBreaker.isOpen) {
+            this.log('ERROR', `[${new Date().toISOString()}] 🔴 Circuit breaker opened mid-reconciliation, aborting to prevent damage`);
+            break;
+          }
+          continue; // Skip to next user
+        }
+
+        const fetchCacheTime = Date.now() - fetchCacheStart;
+        timing.fetchCachedUsersMs += fetchCacheTime;
+        this.trackOperation('fetchCachedUser', fetchCacheTime, { externalId: externalId.substring(0, 8), hit: !!cachedUser, error: redisError });
+
+        // Reset circuit breaker on success
+        if (!redisError && this.redisCircuitBreaker.failures > 0) {
+          this.redisCircuitBreaker.failures = 0;
+        }
+
+        if (cachedUser) {
+          cacheHits++;
+          this.cacheMissCount.delete(externalId);
+          this.log('DEBUG', `[${new Date().toISOString()}] ✅ ${userLog}: Cache HIT (${fetchCacheTime}ms)`);
+
+          // 2b: Compare for changes (returns { hasChanges, isReactivation })
+          const compareStart = Date.now();
+          const changeResult = this.hasChanges(chatUser, cachedUser);
+          const compareTime = Date.now() - compareStart;
+          timing.compareChangesMs += compareTime;
+          this.trackOperation('compareChanges', compareTime, { externalId: externalId.substring(0, 8), needsUpdate: changeResult.hasChanges, isReactivation: changeResult.isReactivation });
+
+          if (changeResult.hasChanges) {
+            // Track reactivations separately
+            if (changeResult.isReactivation) {
+              reactivated++;
+              this.log('INFO', `[${new Date().toISOString()}] ♻️ ${userLog}: Re-activating user (was inactive, now active in cache)`);
+            }
+
+            // 2c: Update user from cache
+            const updateStart = Date.now();
+            this.log('INFO', `[${new Date().toISOString()}] ✏️ ${userLog}: Updating from cache...`);
+            await this.updateChatDbUserFromCache(externalId, cachedUser);
+            const updateTime = Date.now() - updateStart;
+            timing.updateUsersMs += updateTime;
+            this.trackOperation('updateUser', updateTime, { externalId: externalId.substring(0, 8) });
+            updated++;
+
+            // 2d: Check and deactivate duplicates
+            const dupStart = Date.now();
+            const dupCount = await this.deactivateDuplicateUsers(
+              externalId,
+              cachedUser.email,
+              cachedUser.phone,
+              cachedUser.role || 'customer'
+            );
+            const dupTime = Date.now() - dupStart;
+            timing.deactivateDuplicatesMs += dupTime;
+            if (dupCount > 0) {
+              this.trackOperation('deactivateDuplicate', dupTime, { externalId: externalId.substring(0, 8), duplicates: dupCount });
+              duplicatesDeactivated += dupCount;
+              sessionsClosed += dupCount;
+            }
+
+            this.log('SUCCESS', `[${new Date().toISOString()}] ✅ ${userLog}: Updated (${updateTime}ms), ${dupCount} duplicates deactivated`);
+          }
+        } else {
+          // Cache MISS - User not in Redis cache
+          // This typically means user was deleted from backend (cache was invalidated)
+          cacheMisses++;
+          const missCount = (this.cacheMissCount.get(externalId) || 0) + 1;
+          this.cacheMissCount.set(externalId, missCount);
+
+          const shouldInactivate = this.immediateInactive || (missCount >= this.staleMissThreshold);
+
+          if (this.immediateInactive) {
+            this.log('WARNING', `[${new Date().toISOString()}] 🗑️ ${userLog}: Cache MISS (${fetchCacheTime}ms) - IMMEDIATE INACTIVATION (user likely deleted from backend)`);
+          } else {
+            this.log('DEBUG', `[${new Date().toISOString()}] ❌ ${userLog}: Cache MISS (${fetchCacheTime}ms) - miss count: ${missCount}/${this.staleMissThreshold}`);
+          }
+
+          if (shouldInactivate) {
+            // Mark as inactive and close sessions - user was deleted from backend
+            const inactiveStart = Date.now();
+            const reason = this.immediateInactive ? 'User deleted from backend (not in cache)' : `Threshold exceeded after ${missCount} consecutive misses`;
+            this.log('WARNING', `[${new Date().toISOString()}] ⚠️ ${userLog}: ${reason}, marking inactive...`);
+            await this.markUserInactive(externalId);
+            const inactiveTime = Date.now() - inactiveStart;
+            timing.markInactiveMs += inactiveTime;
+            this.trackOperation('markInactive', inactiveTime, { externalId: externalId.substring(0, 8) });
+            markedInactive++;
+
+            // Close sessions
+            const closeStart = Date.now();
+            const closed = await this.closeUserSessions(externalId);
+            const closeTime = Date.now() - closeStart;
+            timing.closeSessionsMs += closeTime;
+            if (closed) {
+              this.trackOperation('closeUserSessions', closeTime, { externalId: externalId.substring(0, 8) });
+              sessionsClosed++;
+            }
+
+            this.cacheMissCount.delete(externalId);
+          }
+        }
+      }
+
+      const totalDuration = Date.now() - reconcileStart;
+      this.syncStats.totalSynced += updated;
+      this.syncStats.lastSyncTime = new Date();
+      this.syncStats.lastSyncDuration = totalDuration;
+      this.syncStats.consecutiveFailures = 0; // Reset on success
+
+      // Cleanup cacheMissCount for users no longer in chat DB
+      const chatUserIds = new Set(chatUsers.map(u => u.externalId));
+      this.cleanupCacheMissCount(chatUserIds);
+
+      // Generate and log detailed report
+      const report = {
+        totalUsers: chatUsers.length,
+        cacheHits,
+        cacheMisses,
+        redisErrors,
+        updated,
+        reactivated,
+        markedInactive,
+        duplicatesDeactivated,
+        sessionsClosed,
+        durationMs: totalDuration,
+        breakdown: timing,
+        circuitBreaker: {
+          failures: this.redisCircuitBreaker.failures,
+          isOpen: this.redisCircuitBreaker.isOpen
+        },
+        cacheMissCountSize: this.cacheMissCount.size
+      };
+      this.logReconciliationReport(report);
+
+    } catch (error) {
+      const errorTimestamp = new Date().toISOString();
+      this.syncStats.errors++;
+      this.syncStats.consecutiveFailures++;
+      this.log('ERROR', `[${errorTimestamp}] ❌ Cache reconciliation FAILED: ${error.message}`);
+      this.log('ERROR', `[${errorTimestamp}] ❌ Stack: ${error.stack}`);
+
+      // Log partial report if we have data
+      if (chatUsers.length > 0) {
+        console.log('\n⚠️ PARTIAL RECONCILIATION REPORT (before failure):');
+        console.log(`   Users processed: ${cacheHits + cacheMisses}/${chatUsers.length}`);
+        console.log(`   Cache hits: ${cacheHits}, misses: ${cacheMisses}`);
+        console.log(`   Redis errors: ${redisErrors}`);
+        console.log(`   Updated: ${updated}, Inactive: ${markedInactive}`);
+        console.log(`   Circuit breaker: ${this.redisCircuitBreaker.isOpen ? 'OPEN' : 'closed'} (${this.redisCircuitBreaker.failures} failures)`);
+      }
+    } finally {
+      this.isSyncInProgress = false;
+      this.log('INFO', `[${new Date().toISOString()}] 🏁 Reconciliation cycle complete`);
+    }
+  }
+
+  /**
+   * Start cache reconciliation loop (every 15 seconds by default)
+   */
+  async startCacheReconciliation() {
+    await this.initRedis();
+    this.log('SUCCESS', `Starting cache reconciliation (every ${this.syncIntervalSeconds}s)...`);
+
+    // Run immediately
+    await this.reconcileCache();
+
+    // Then on interval
+    this.scheduledSyncTimeout = setInterval(() => {
+      this.reconcileCache();
+    }, this.syncIntervalSeconds * 1000);
+
+    this.syncStats.scheduledSyncActive = true;
+  }
+
   // Complete setup method
   async setup() {
     this.log('INFO', '🚀 Setting up User Table Sync Service...');
+
+    // Check if cache mode is enabled (SYNC_MODE=cache)
+    const syncMode = process.env.SYNC_MODE || 'legacy';
+
+    if (syncMode === 'cache') {
+      this.log('INFO', '📦 CACHE MODE: Reconciling Redis cache → Chat DB');
+      this.log('INFO', `   Interval: ${this.syncIntervalSeconds} seconds`);
+      this.log('INFO', `   Stale threshold: ${this.staleMissThreshold} misses`);
+      this.log('INFO', `   Immediate inactive: ${this.immediateInactive ? 'YES (deleted users marked inactive immediately)' : 'NO (wait for threshold)'}`);
+      this.log('INFO', `   Redis host: ${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}`);
+      this.log('INFO', `   Redis TLS: ${process.env.REDIS_TLS === 'true' ? 'YES' : 'NO'}`);
+
+      try {
+        // Start cache reconciliation
+        await this.startCacheReconciliation();
+
+        // Start HTTP server for health checks
+        this.startHttpServer();
+
+        // Start pool health check
+        this.startPoolHealthCheck();
+
+        // Setup graceful shutdown
+        this.setupGracefulShutdown();
+
+        this.log('SUCCESS', '📦 Cache reconciliation service is running!');
+        return;
+      } catch (error) {
+        await this.logError('CACHE_SETUP_FAILED', null, error);
+        process.exit(1);
+      }
+    }
+
+    // LEGACY MODE: DB-to-DB sync
+    this.log('INFO', '🔄 LEGACY MODE: Source DB → Chat DB sync');
 
     try {
       // 1. Initial bulk sync
